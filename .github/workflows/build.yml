@@ -1,0 +1,130 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+
+      - name: Install Android SDK platform, build-tools, NDK & CMake
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;25.2.9519653" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+
+      - name: Kasih permission ke gradlew
+        run: chmod +x gradlew
+
+      # ──────────────────────────────────────────
+      # DEBUG APK (selalu di-build)
+      # ──────────────────────────────────────────
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # ──────────────────────────────────────────
+      # RELEASE APK (hanya kalau keystore secret tersedia)
+      # ──────────────────────────────────────────
+      - name: Cek keystore secret
+        id: keystore_check
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::warning::KEYSTORE_BASE64 secret kosong, skip Release APK build."
+          fi
+
+      - name: Decode keystore
+        id: decode_keystore
+        if: steps.keystore_check.outputs.available == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set +e
+          KEYSTORE_PATH="$RUNNER_TEMP/keystore.jks"
+          printf '%s' "$KEYSTORE_BASE64" \
+            | tr -d ' \t\r\n' \
+            | sed 's|^data:[^,]*,||' \
+            | base64 -d --ignore-garbage > "$KEYSTORE_PATH" 2>/tmp/b64err.log
+          rc=$?
+          if [ $rc -ne 0 ] || [ ! -s "$KEYSTORE_PATH" ]; then
+            echo "::warning::KEYSTORE_BASE64 invalid (decode gagal / hasil kosong). Fallback ke release unsigned."
+            echo "::warning::base64 stderr: $(cat /tmp/b64err.log 2>/dev/null | head -c 500)"
+            rm -f "$KEYSTORE_PATH"
+            echo "decoded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          size=$(stat -c%s "$KEYSTORE_PATH")
+          if [ "$size" -lt 256 ]; then
+            echo "::warning::Keystore hasil decode cuma ${size} byte, kemungkinan rusak. Fallback ke unsigned."
+            rm -f "$KEYSTORE_PATH"
+            echo "decoded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+          echo "decoded=true" >> $GITHUB_OUTPUT
+
+      - name: Build Release APK (signed)
+        if: steps.decode_keystore.outputs.decoded == 'true'
+        env:
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease --stacktrace --no-daemon \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_PATH" \
+            -Pandroid.injected.signing.store.password="$STORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Build Release APK (unsigned, fallback)
+        if: steps.decode_keystore.outputs.decoded != 'true'
+        run: ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Bersihkan keystore
+        if: always() && steps.keystore_check.outputs.available == 'true'
+        run: rm -f "$RUNNER_TEMP/keystore.jks"
