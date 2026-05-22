@@ -1,0 +1,114 @@
+================================================================
+  MIDI-to-QWERTY Piano Mapping (88 Keys - Roblox Virtual Piano)
+================================================================
+
+Format: MIDI Note | Piano Key | QWERTY Key | Modifier
+-------------------------------------------------------
+Modifier Legend:
+  (none)  = No modifier, press key directly
+  SHIFT   = Hold Left Shift + key
+  CTRL    = Hold Left Ctrl + key
+-------------------------------------------------------
+
+=== OCTAVE 0 (A0 - B1) === [CTRL + key]
+MIDI 21  | A0   | Ctrl+1
+MIDI 22  | A#0  | Ctrl+2
+MIDI 23  | B0   | Ctrl+3
+MIDI 24  | C1   | Ctrl+4
+MIDI 25  | C#1  | Ctrl+5
+MIDI 26  | D1   | Ctrl+6
+MIDI 27  | D#1  | Ctrl+7
+MIDI 28  | E1   | Ctrl+8
+MIDI 29  | F1   | Ctrl+9
+MIDI 30  | F#1  | Ctrl+0
+MIDI 31  | G1   | Ctrl+Q
+MIDI 32  | G#1  | Ctrl+W
+MIDI 33  | A1   | Ctrl+E
+MIDI 34  | A#1  | Ctrl+R
+MIDI 35  | B1   | Ctrl+T
+
+=== OCTAVE 2-6 (C2 - B6) === [Normal / Shift keys]
+MIDI 36  | C2   | 1
+MIDI 37  | C#2  | !        (Shift+1)
+MIDI 38  | D2   | 2
+MIDI 39  | D#2  | @        (Shift+2)
+MIDI 40  | E2   | 3
+MIDI 41  | F2   | 4
+MIDI 42  | F#2  | $        (Shift+4)
+MIDI 43  | G2   | 5
+MIDI 44  | G#2  | %        (Shift+5)
+MIDI 45  | A2   | 6
+MIDI 46  | A#2  | ^        (Shift+6)
+MIDI 47  | B2   | 7
+MIDI 48  | C3   | 8
+MIDI 49  | C#3  | *        (Shift+8)
+MIDI 50  | D3   | 9
+MIDI 51  | D#3  | (        (Shift+9)
+MIDI 52  | E3   | 0
+MIDI 53  | F3   | q
+MIDI 54  | F#3  | Q        (Shift+Q)
+MIDI 55  | G3   | w
+MIDI 56  | G#3  | W        (Shift+W)
+MIDI 57  | A3   | e
+MIDI 58  | A#3  | E        (Shift+E)
+MIDI 59  | B3   | r
+MIDI 60  | C4   | t
+MIDI 61  | C#4  | T        (Shift+T)
+MIDI 62  | D4   | y
+MIDI 63  | D#4  | Y        (Shift+Y)
+MIDI 64  | E4   | u
+MIDI 65  | F4   | i
+MIDI 66  | F#4  | I        (Shift+I)
+MIDI 67  | G4   | o
+MIDI 68  | G#4  | O        (Shift+O)
+MIDI 69  | A4   | p
+MIDI 70  | A#4  | P        (Shift+P)
+MIDI 71  | B4   | a
+MIDI 72  | C5   | s
+MIDI 73  | C#5  | S        (Shift+S)
+MIDI 74  | D5   | d
+MIDI 75  | D#5  | D        (Shift+D)
+MIDI 76  | E5   | f
+MIDI 77  | F5   | g
+MIDI 78  | F#5  | G        (Shift+G)
+MIDI 79  | G5   | h
+MIDI 80  | G#5  | H        (Shift+H)
+MIDI 81  | A5   | j
+MIDI 82  | A#5  | J        (Shift+J)
+MIDI 83  | B5   | k
+MIDI 84  | C6   | l
+MIDI 85  | C#6  | L        (Shift+L)
+MIDI 86  | D6   | z
+MIDI 87  | D#6  | Z        (Shift+Z)
+MIDI 88  | E6   | x
+MIDI 89  | F6   | c
+MIDI 90  | F#6  | C        (Shift+C)
+MIDI 91  | G6   | v
+MIDI 92  | G#6  | V        (Shift+V)
+MIDI 93  | A6   | b
+MIDI 94  | A#6  | B        (Shift+B)
+MIDI 95  | B6   | n
+
+=== OCTAVE 7 (C7 - C8) === [CTRL + key]
+MIDI 96  | C7   | m
+MIDI 97  | C#7  | Ctrl+Y
+MIDI 98  | D7   | Ctrl+U
+MIDI 99  | D#7  | Ctrl+I
+MIDI 100 | E7   | Ctrl+O
+MIDI 101 | F7   | Ctrl+P
+MIDI 102 | F#7  | Ctrl+A
+MIDI 103 | G7   | Ctrl+S
+MIDI 104 | G#7  | Ctrl+D
+MIDI 105 | A7   | Ctrl+F
+MIDI 106 | A#7  | Ctrl+G
+MIDI 107 | B7   | Ctrl+H
+MIDI 108 | C8   | Ctrl+J
+
+================================================================
+NOTES:
+- Total: 88 keys (full piano range, A0 to C8)
+- White keys (naturals) = lowercase letters or numbers (no modifier)
+- Black keys (sharps/flats) = SHIFT + corresponding key
+- Extreme low/high octaves = CTRL + key
+- This mapping is used by Roblox Virtual Piano and similar games
+================================================================
