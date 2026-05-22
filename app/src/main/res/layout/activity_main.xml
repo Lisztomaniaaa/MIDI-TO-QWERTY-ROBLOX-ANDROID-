@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/gradient_bg"
+    android:scrollbars="none"
+    android:fillViewport="true"
+    android:overScrollMode="never">
+
+    <LinearLayout
+        android:id="@+id/l"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingHorizontal="24dp"
+        android:paddingTop="40dp"
+        android:paddingBottom="32dp">
+
+        <!-- ═══════════ HEADER ═══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="32dp">
+
+            <ImageView
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:src="@drawable/iconpop"
+                android:layout_marginEnd="14dp" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="papiano"
+                    android:textColor="#C084FC"
+                    android:textSize="26sp"
+                    android:textStyle="bold"
+                    android:letterSpacing="0.04" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/brand_tagline"
+                    android:textColor="#5B4D7A"
+                    android:textSize="11sp"
+                    android:letterSpacing="0.06" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#3B3556"
+                android:textSize="10sp"
+                android:letterSpacing="0.1" />
+        </LinearLayout>
+
+        <!-- ═══════════ STATUS OVERVIEW CARD ═══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/card_glass"
+            android:orientation="vertical"
+            android:padding="20dp"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="14dp">
+
+                <View
+                    android:id="@+id/status_indicator"
+                    android:layout_width="8dp"
+                    android:layout_height="8dp"
+                    android:background="@drawable/bubble_bg"
+                    android:backgroundTint="@color/text_muted"
+                    android:layout_marginEnd="10dp" />
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="SYSTEM STATUS"
+                    android:textColor="#6B5B8A"
+                    android:textSize="10sp"
+                    android:letterSpacing="0.15"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <!-- Permission row -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="10dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Permission"
+                    android:textColor="#94A3B8"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_permission_status"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/permission_not_granted"
+                    android:textColor="@color/red"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#1A1525"
+                android:layout_marginBottom="10dp" />
+
+            <!-- Service row -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Service"
+                    android:textColor="#94A3B8"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_service_status"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/service_stopped"
+                    android:textColor="@color/text_muted"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ═══════════ GLOW DIVIDER ═══════════ -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@drawable/divider_glow"
+            android:layout_marginVertical="8dp" />
+
+        <!-- ═══════════ ACTIVATE CARD ═══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/card_glass"
+            android:orientation="vertical"
+            android:padding="20dp"
+            android:layout_marginBottom="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="ACTIVATION"
+                android:textColor="#6B5B8A"
+                android:textSize="10sp"
+                android:letterSpacing="0.15"
+                android:textStyle="bold"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#64596E"
+                android:textSize="12sp"
+                android:lineSpacingExtra="3dp"
+                android:layout_marginBottom="16dp" />
+
+            <Button
+                android:id="@+id/b"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:text="@string/activate"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:textAllCaps="false"
+                android:background="@drawable/button_danger"
+                android:stateListAnimator="@null" />
+        </LinearLayout>
+
+        <!-- ═══════════ SERVICE CARD ═══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/card_glass"
+            android:orientation="vertical"
+            android:padding="20dp"
+            android:layout_marginBottom="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="START PLAYING"
+                android:textColor="#6B5B8A"
+                android:textSize="10sp"
+                android:letterSpacing="0.15"
+                android:textStyle="bold"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#64596E"
+                android:textSize="12sp"
+                android:lineSpacingExtra="3dp"
+                android:layout_marginBottom="16dp" />
+
+            <Button
+                android:id="@+id/btn_start_playing"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:text="@string/start_playing"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:textAllCaps="false"
+                android:background="@drawable/button_gradient"
+                android:stateListAnimator="@null" />
+        </LinearLayout>
+
+        <!-- ═══════════ GLOW DIVIDER ═══════════ -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@drawable/divider_glow"
+            android:layout_marginVertical="8dp" />
+
+        <!-- ═══════════ CLOSE APP ═══════════ -->
+        <Button
+            android:id="@+id/btn_force_close"
+            android:layout_width="match_parent"
+            android:layout_height="46dp"
+            android:text="@string/close_app"
+            android:textColor="#7A7089"
+            android:textSize="12sp"
+            android:textAllCaps="false"
+            android:background="@drawable/button_muted"
+            android:stateListAnimator="@null"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Want updates? Contact me on Discord @jvkowi"
+            android:textColor="#5B4D7A"
+            android:textSize="11sp"
+            android:gravity="center"
+            android:layout_marginTop="8dp" />
+
+    </LinearLayout>
+</ScrollView>

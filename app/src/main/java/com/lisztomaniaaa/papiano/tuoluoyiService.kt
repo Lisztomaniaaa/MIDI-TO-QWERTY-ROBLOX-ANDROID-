@@ -1,0 +1,680 @@
+package com.lisztomaniaaa.papiano
+
+import android.accessibilityservice.AccessibilityService
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.graphics.drawable.Icon
+import android.media.midi.MidiDeviceInfo
+import android.media.midi.MidiManager
+import android.media.midi.MidiOutputPort
+import android.media.midi.MidiReceiver
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.os.RemoteException
+import android.provider.Settings
+import android.util.Log
+import android.view.KeyEvent
+import android.view.accessibility.AccessibilityEvent
+import android.widget.Toast
+import androidx.core.content.ContextCompat
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Background-only MIDI -> virtual keyboard bridge. No popup overlay, no UI.
+ *
+ * Mode is locked to QWERTY. Octave range covers the full 88-key span (21..107).
+ * MIDI device name is broadcast to MainActivity via "intent.tuoluoyi.midi_device".
+ *
+ * STABILITY NOTES (POCO X3 Pro / MIUI 14 bug-report driven):
+ * Bug report user nunjukin system_server kena watchdog kill 3x karena deadlock
+ * di UsbHostManager (UsbDirectMidiDevice.close <-> openDevice). Kalau kita
+ * panggil MidiManager.devices / openDevice / registerDeviceCallback SYNC di
+ * main thread service, kita bakal ANR ke deadlock yang sama.
+ *
+ * Fix: semua MIDI binder call dipindah ke HandlerThread sendiri ("midi-thread")
+ * dan di-defer 1.5 detik setelah onServiceConnected supaya system_server sempat
+ * settle dari accessibility binding. Callback dari MidiManager juga dikirim
+ * lewat handler thread itu (bukan main), supaya kalau hang gak nge-block UI.
+ */
+class tuoluoyiService : AccessibilityService() {
+
+    private var iGamePad: IGamePad? = null
+    private var isBroadcastRegistered = false
+    private var isGamePadCreated = false
+    private var sp: SharedPreferences? = null
+
+    private var midiManager: MidiManager? = null
+    private var deviceCallback: MidiManager.DeviceCallback? = null
+    private var midiOutputPort: MidiOutputPort? = null
+
+    /**
+     * ID device MIDI yg lagi kita pegang port-nya. -1 = belum ada. Dipake
+     * supaya periodic rescan tau "device baru" vs "device yg sama" -> gak
+     * spam open ulang port tiap 3 detik.
+     */
+    private var currentMidiDeviceId: Int = -1
+    private var lastBroadcastName: String = ""
+
+    /**
+     * True saat kita lagi tunggu callback dari MidiManager.openDevice.
+     * Tanpa flag ini, rescan periodik tiap 3s bisa nge-trigger openDevice
+     * kedua kalinya kalau callback pertama lambat (USB MIDI di MIUI sering
+     * pelan), nyebabin port double-open + Toast spam Connected/Disconnected.
+     */
+    private var isOpeningMidi: Boolean = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Worker thread khusus buat semua MIDI binder ops. Dilahirin di onServiceConnected. */
+    private var midiThread: HandlerThread? = null
+    private var midiHandler: Handler? = null
+
+    /**
+     * Periodic rescan. Interval adaptif:
+     *   - 3s kalau ada MIDI device connected (responsive reconnect)
+     *   - 10s kalau gak ada device (idle mode, hemat CPU/battery)
+     * Fallback kalau MidiManager.DeviceCallback miss event.
+     */
+    private val rescanRunnable: Runnable = object : Runnable {
+        override fun run() {
+            try { rescanMidi() } catch (e: Throwable) { Log.e(TAG, "rescan", e) }
+            finally {
+                // Adaptive interval: fast saat connected, slow saat idle
+                val interval = if (currentMidiDeviceId != -1) 3000L else 10000L
+                midiHandler?.postDelayed(this, interval)
+            }
+        }
+    }
+
+    private val mBroadcastReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            try {
+                when (intent.action) {
+                    "intent.tuoluoyi.exit" -> {
+                        try { disableSelf() } catch (e: Throwable) { Log.w(TAG, "disableSelf", e) }
+                    }
+                    "intent.tuoluoyi.sendBinder" -> handleBinder(intent)
+                    "intent.tuoluoyi.midi_request" -> {
+                        // Floating panel minta snapshot state. Force re-broadcast
+                        // dgn bypass dedup biar UI dapet info terbaru meskipun
+                        // device-nya gak berubah sejak last broadcast.
+                        midiHandler?.post {
+                            val current = lastBroadcastName
+                            lastBroadcastName = "\u0000force-resend"
+                            broadcastMidiDevice(current)
+                        }
+                    }
+                    "intent.tuoluoyi.midi_file_note" -> {
+                        // MIDI file player note event — forward to daemon
+                        val note = intent.getIntExtra("note", -1)
+                        val down = intent.getBooleanExtra("down", false)
+                        if (note in 21..107) {
+                            try { iGamePad?.qwertyKey(note, down) }
+                            catch (_: Throwable) {}
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Service receiver onReceive error", t)
+            }
+        }
+    }
+
+    private fun handleBinder(intent: Intent) {
+        val raw = extractBinder(intent)
+        if (raw == null) {
+            Log.w(TAG, "handleBinder: extractBinder returned null")
+
+            return
+        }
+        if (!raw.pingBinder()) {
+            Log.w(TAG, "handleBinder: binder dead (ping failed)")
+
+            return
+        }
+        val binder: android.os.IBinder = raw
+
+        iGamePad = IGamePad.Stub.asInterface(binder)
+        try {
+            iGamePad?.changeMode(0)
+            isGamePadCreated = iGamePad?.create() == true
+        } catch (e: RemoteException) {
+            Log.e(TAG, "changeMode/create", e)
+
+        }
+
+        if (isGamePadCreated) {
+            Log.d(TAG, "Virtual HID ready, MIDI bridge live")
+            warnedNullBridge.set(false)
+
+        } else {
+            Log.e(TAG, "Virtual HID create FAILED (uHID open needs root/shell perm)")
+
+            try { iGamePad?.closeAndExit() } catch (_: RemoteException) {}
+            iGamePad = null
+        }
+    }
+
+    /**
+     * Show toast dari thread mana pun (kebanyakan call dari midiHandler thread).
+     * Toast wajib di main thread; kalau enggak, IllegalStateException.
+     */
+    private fun toastOnMain(msg: String) {
+        mainHandler.post {
+            try { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+            catch (t: Throwable) { Log.w(TAG, "toast", t) }
+        }
+    }
+
+    /**
+     * One-shot warning flag: kalau iGamePad null saat user pencet MIDI key,
+     * kita kasih toast + log SEKALI, bukan tiap note (biar gak spam toast).
+     * Reset ke false pas binder berhasil terhubung.
+     */
+    private val warnedNullBridge = AtomicBoolean(false)
+
+    /**
+     * Support legacy daemon (com.tile.tuoluoyi.BinderContainer) supaya app
+     * gak crash kalau daemon lama dari install sebelumnya masih hidup.
+     * Lihat penjelasan lengkap di MainActivity.extractBinder.
+     */
+    private fun extractBinder(intent: Intent): android.os.IBinder? = try {
+        when (val raw = intent.getParcelableExtra<android.os.Parcelable>("binder")) {
+            is BinderContainer -> raw.binder
+            is com.tile.tuoluoyi.BinderContainer -> {
+                Log.w(TAG, "Legacy daemon detected, sending exit")
+                try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
+                raw.binder
+            }
+            else -> null
+        }
+    } catch (t: Throwable) {
+        Log.w(TAG, "extractBinder failed: ${t.javaClass.simpleName}")
+        try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
+        null
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        sp = getSharedPreferences("data", 0)
+
+        // Start MIDI worker thread DULU sebelum apa pun yg mungkin nge-block.
+        if (midiThread == null) {
+            midiThread = HandlerThread("midi-thread").also { it.start() }
+            midiHandler = Handler(midiThread!!.looper)
+        }
+
+        try {
+            ContextCompat.registerReceiver(this, mBroadcastReceiver,
+                IntentFilter("intent.tuoluoyi.sendBinder"),
+                ContextCompat.RECEIVER_EXPORTED)
+            val internalFilter = IntentFilter().apply {
+                addAction("intent.tuoluoyi.exit")
+                addAction("intent.tuoluoyi.midi_request")
+                addAction("intent.tuoluoyi.midi_file_note")
+            }
+            ContextCompat.registerReceiver(this, mBroadcastReceiver,
+                internalFilter,
+                ContextCompat.RECEIVER_NOT_EXPORTED)
+            isBroadcastRegistered = true
+        } catch (e: Throwable) { Log.e(TAG, "registerReceiver", e) }
+
+        // sendNotification harus jalan di sini biar service jadi foreground (Android 14
+        // butuh ini segera setelah accessibility connect, kalau enggak system_server
+        // bisa kill service).
+        try { sendNotification() } catch (e: Throwable) { Log.e(TAG, "sendNotification", e) }
+
+        // autoGrant juga sentuh Settings.Secure (binder), pindah ke worker.
+        midiHandler?.post {
+            try { autoGrantAccessibilityIfNeeded() } catch (e: Throwable) {
+                Log.w(TAG, "autoGrant", e)
+            }
+        }
+
+        // Defer initMidi 1500ms. Berdasarkan bug report MIUI 14, system_server
+        // bisa lagi recovering dari UsbHostManager deadlock pas user buka app.
+        // Kasih waktu settle dulu sebelum binder MidiManager. Setelah init,
+        // mulai polling rescan tiap 3s.
+        midiHandler?.postDelayed({
+            try { initMidi() } catch (e: Throwable) { Log.e(TAG, "initMidi", e) }
+            midiHandler?.postDelayed(rescanRunnable, 3000L)
+        }, 1500L)
+
+        // Bridge health check: 6 detik setelah service connect, kalau iGamePad
+        // masih null artinya daemon belum kirim binder. AUTO-RESPAWN daemon via
+        // Shizuku/root supaya user gak perlu balik ke MainActivity dan pencet
+        // Activate manual lagi.
+        mainHandler.postDelayed({
+            if (iGamePad == null) {
+                Log.w(TAG, "Bridge health check FAIL after 6s: iGamePad still null. " +
+                        "Auto-respawning daemon...")
+
+                respawnDaemon()
+
+                // Cek lagi 5 detik setelah respawn — kalau masih null, kasih
+                // diagnostic terakhir biar user tau bantuan apa yg dibutuhin.
+                mainHandler.postDelayed({
+                    if (iGamePad == null) {
+
+                    }
+                }, 5000L)
+            }
+        }, 6000L)
+
+        // Floating panel auto-on: kalau user udah granting SYSTEM_ALERT_WINDOW
+        // DAN belum dismiss panel via tombol ✕, hidupin panel pas accessibility
+        // nyala. Hormati user_dismissed flag biar gak nge-restart panel yg
+        // baru aja user tutup.
+        try {
+            val dismissed = sp?.getBoolean(
+                FloatingPanelService.KEY_USER_DISMISSED, false) ?: false
+            if (Settings.canDrawOverlays(this) && !dismissed) {
+                val svcIntent = Intent(this, FloatingPanelService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(svcIntent)
+                } else {
+                    startService(svcIntent)
+                }
+            }
+        } catch (e: Throwable) { Log.w(TAG, "startFloatingPanel", e) }
+    }
+
+    /**
+     * Re-spawn daemon process via Shizuku atau root (sesuai activation_method
+     * yg user pilih waktu Activate). Dipanggil kalau bridge null setelah 6s.
+     *
+     * Daemon lama yg udah hidup tapi kirim sticky broadcast lama (binder dead)
+     * akan di-replace karena starter.sh spawn process baru — process baru kirim
+     * sticky broadcast fresh dengan binder valid.
+     *
+     * Jalan di background thread (Shizuku.newProcess + Process.waitFor blocking).
+     */
+    private fun respawnDaemon() {
+        Thread {
+            val method = sp?.getString("activation_method", "shizuku") ?: "shizuku"
+            val extDir = getExternalFilesDir(null)
+            val base = extDir?.path ?: filesDir.path
+            val cmd = "sh $base/starter.sh"
+            try {
+                when (method) {
+                    "root" -> {
+                        val p = Runtime.getRuntime().exec("su")
+                        p.outputStream.use {
+                            it.write("$cmd\nexit\n".toByteArray())
+                            it.flush()
+                        }
+                        p.waitFor()
+                        Log.d(TAG, "respawnDaemon: root path executed")
+                    }
+                    "adb" -> {
+                        // ADB activation berarti user pakai 'adb shell ...' manual
+                        // sebelumnya. Kita gak punya channel untuk re-trigger.
+
+                        return@Thread
+                    }
+                    else -> {
+                        // Shizuku path
+                        if (rikka.shizuku.Shizuku.checkSelfPermission()
+                                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+
+                            return@Thread
+                        }
+                        val p = rikka.shizuku.Shizuku.newProcess(arrayOf("sh"), null, null)
+                        p.outputStream.use {
+                            it.write("$cmd\nexit\n".toByteArray())
+                            it.flush()
+                        }
+                        p.waitFor()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            p.destroyForcibly()
+                        } else {
+                            @Suppress("DEPRECATION") p.destroy()
+                        }
+                        Log.d(TAG, "respawnDaemon: shizuku path executed")
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "respawnDaemon", e)
+
+            }
+        }.start()
+    }
+
+    /**
+     * Re-write Settings.Secure on each connect so the service survives reboots
+     * without the user having to dive into Accessibility settings.
+     * Run on midiHandler thread.
+     */
+    private fun autoGrantAccessibilityIfNeeded() {
+        val svcName = ComponentName(packageName, tuoluoyiService::class.java.name).flattenToString()
+        try {
+            val current = Settings.Secure.getString(
+                contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+            if (!current.contains(svcName)) {
+                val newVal = if (current.isEmpty()) svcName else "$svcName:$current"
+                Settings.Secure.putInt(contentResolver,
+                    Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+                Settings.Secure.putString(contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, newVal)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "autoGrant: ${e.message}")
+        }
+    }
+
+    /* ---------------- MIDI (semua di midiHandler thread) ---------------- */
+
+    /** MUST run on midiHandler thread. */
+    private fun initMidi() {
+        if (midiManager == null) {
+            midiManager = try {
+                getSystemService(MIDI_SERVICE) as? MidiManager
+            } catch (e: Throwable) {
+                Log.e(TAG, "getSystemService(MIDI)", e); null
+            }
+        }
+        val mm = midiManager ?: run {
+            Log.w(TAG, "MidiManager unavailable, MIDI disabled")
+            return
+        }
+
+        deviceCallback = object : MidiManager.DeviceCallback() {
+            override fun onDeviceAdded(info: MidiDeviceInfo) {
+                Log.d(TAG, "callback onDeviceAdded id=${info.id}")
+                midiHandler?.post {
+                    try { rescanMidi() } catch (e: Throwable) {
+                        Log.e(TAG, "onDeviceAdded rescan", e)
+                    }
+                }
+            }
+            override fun onDeviceRemoved(info: MidiDeviceInfo) {
+                Log.d(TAG, "callback onDeviceRemoved id=${info.id}")
+                midiHandler?.post {
+                    if (info.id == currentMidiDeviceId) {
+                        currentMidiDeviceId = -1
+                        try { midiOutputPort?.close() } catch (_: Throwable) {}
+                        midiOutputPort = null
+                        // Kalau open-nya in-flight pas device dicabut, jgn
+                        // tinggalin flag stuck.
+                        isOpeningMidi = false
+                        broadcastMidiDevice("")
+                    }
+                }
+            }
+        }
+        try {
+            mm.registerDeviceCallback(deviceCallback!!, midiHandler)
+        } catch (e: Throwable) {
+            Log.e(TAG, "registerDeviceCallback", e)
+        }
+
+        // Initial scan (callback gak fire utk device yg udah attached SEBELUM
+        // registerDeviceCallback dipanggil).
+        rescanMidi()
+    }
+
+    /**
+     * Cek device list aktual + reconcile dengan state kita. Aman dipanggil
+     * berulang — kalau device yg lagi kita pegang masih ada, no-op. Kalau
+     * device baru -> open. Kalau device kita ilang -> cleanup + broadcast.
+     *
+     * MUST run on midiHandler thread.
+     */
+    private fun rescanMidi() {
+        val mm = midiManager ?: return
+        if (isOpeningMidi) {
+            // Open lain lagi in-flight; jangan tumpuk.
+            return
+        }
+        val devices: List<MidiDeviceInfo> = try {
+            mm.devices?.toList() ?: emptyList()
+        } catch (e: Throwable) {
+            Log.e(TAG, "mm.devices throw (deadlock?)", e)
+            return
+        }
+
+        // Only log when device count changes — no spam tiap 3/10s.
+        val outputCapable = devices.filter { it.outputPortCount > 0 }
+
+        if (outputCapable.isEmpty()) {
+            // Gak ada device output-capable. Kalau sebelumnya kita pegang
+            // sesuatu, cleanup + kasih tau popup.
+            if (currentMidiDeviceId != -1 || lastBroadcastName.isNotEmpty()) {
+                currentMidiDeviceId = -1
+                try { midiOutputPort?.close() } catch (_: Throwable) {}
+                midiOutputPort = null
+                broadcastMidiDevice("")
+            }
+            return
+        }
+
+        // Stabilkan pilihan device: kalau device current masih ada di list,
+        // tetap pake itu (jangan flap ke device lain meskipun urutan
+        // mm.devices berubah). Baru fallback ke first.
+        val target = outputCapable.firstOrNull { it.id == currentMidiDeviceId }
+            ?: outputCapable.first()
+
+        if (target.id == currentMidiDeviceId && midiOutputPort != null) {
+            return
+        }
+
+        Log.d(TAG, "MIDI switching device: $currentMidiDeviceId -> ${target.id}")
+        try { handleDevice(target) } catch (e: Throwable) {
+            Log.e(TAG, "handleDevice from rescan", e)
+        }
+    }
+
+    /** MUST run on midiHandler thread. */
+    private fun handleDevice(deviceInfo: MidiDeviceInfo) {
+        if (deviceInfo.outputPortCount <= 0) return
+        val mm = midiManager ?: return
+        val targetId = deviceInfo.id
+        isOpeningMidi = true
+        try {
+            mm.openDevice(deviceInfo, { device ->
+                try {
+                    if (device == null) {
+                        Log.e(TAG, "Failed to open MIDI device id=$targetId")
+                        // Open gagal — biarin currentMidiDeviceId stay di state
+                        // sebelumnya. Rescan periodik bakal nyoba lagi nanti.
+                        return@openDevice
+                    }
+                    // Cleanup port lama (kalau ada) sebelum claim port baru.
+                    try { midiOutputPort?.close() } catch (_: Throwable) {}
+                    midiOutputPort = null
+
+                    val newPort = try {
+                        device.openOutputPort(0)
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "openOutputPort", e); null
+                    }
+                    if (newPort == null) {
+                        Log.e(TAG, "openOutputPort returned null for id=$targetId")
+                        return@openDevice
+                    }
+                    newPort.connect(QwertyReceiver())
+                    midiOutputPort = newPort
+                    currentMidiDeviceId = targetId
+
+                    val deviceName = deviceInfo.properties
+                        .getString(MidiDeviceInfo.PROPERTY_NAME) ?: "Unknown"
+                    broadcastMidiDevice(deviceName)
+                } finally {
+                    isOpeningMidi = false
+                }
+            }, midiHandler)
+        } catch (e: Throwable) {
+            isOpeningMidi = false
+            Log.e(TAG, "midiManager.openDevice", e)
+        }
+    }
+
+    private fun broadcastMidiDevice(name: String) {
+        // De-dupe: kalau name-nya sama dgn yg terakhir kita kirim, skip.
+        // Tanpa ini Toast di FloatingPanelService bakal spam tiap rescan.
+        if (name == lastBroadcastName) return
+        lastBroadcastName = name
+        try {
+            sendBroadcast(Intent("intent.tuoluoyi.midi_device")
+                .setPackage(packageName)
+                .putExtra("name", name)
+                .putExtra("connected", name.isNotEmpty()))
+        } catch (e: Throwable) { Log.w(TAG, "broadcastMidiDevice", e) }
+    }
+
+    private inner class QwertyReceiver : MidiReceiver() {
+        private val NOTE_ON = 0x90
+        private val NOTE_OFF = 0x80
+        private val ALIVE: Byte = 0xFE.toByte()
+
+        @Throws(IOException::class)
+        override fun onSend(data: ByteArray, offset: Int, count: Int, timestamp: Long) {
+            if (count == 0 || data[offset] == ALIVE) return
+
+            var i = offset
+            while (i < offset + count) {
+                val byte = data[i].toInt() and 0xFF
+                if (byte < 0x80) { i++; continue }
+                if (i + 2 >= offset + count) { i++; continue }
+
+                val messageType = byte and 0xF0
+                if (messageType != NOTE_ON && messageType != NOTE_OFF) { i += 3; continue }
+
+                val noteNumber = data[i + 1].toInt() and 0xFF
+                val velocity  = data[i + 2].toInt() and 0xFF
+
+                // QWERTY mode dengan SUSTAIN/HOLD support.
+                //
+                // Banyak MIDI keyboard kirim "key release" sebagai NOTE_ON
+                // velocity=0 (running-status optimization) BUKAN NOTE_OFF
+                // (0x80). Mapping naive `isDown=(messageType==NOTE_ON)`
+                // akan keliru menganggap release sebagai press kedua →
+                // double note tiap pencet+lepas.
+                //
+                // Mapping yang BENAR (dan yang prevent double-notes):
+                //   press   = NOTE_ON  AND velocity > 0   → isDown=true
+                //   release = NOTE_OFF OR  velocity == 0  → isDown=false
+                //
+                // Native side maintain held-keys set, jadi press akan
+                // di-hold sampai release event datang. Tahan tuts =
+                // beneran tahan di virtual HID, bukan tap sekejap.
+                val isPress = (messageType == NOTE_ON) && velocity > 0
+                val isRelease = (messageType == NOTE_OFF) ||
+                        (messageType == NOTE_ON && velocity == 0)
+                if (!isPress && !isRelease) { i += 3; continue }
+
+                if (noteNumber !in 21..107) { i += 3; continue }
+
+                val gp = iGamePad
+                if (gp == null) {
+                    // Diagnostic critical: user pencet MIDI tapi daemon
+                    // belum ke-bind. Tanpa toast ini, user bingung kenapa
+                    // Roblox piano gak nyala. Skip toast utk release
+                    // event biar gak spam dua kali per pencet.
+                    if (isPress && warnedNullBridge.compareAndSet(false, true)) {
+                        Log.e(TAG, "qwertyKey skipped: iGamePad=null. " +
+                                "Daemon belum jalan / binder gak masuk.")
+
+                    }
+                    i += 3; continue
+                }
+
+                try {
+                    gp.qwertyKey(noteNumber, isPress)
+                } catch (e: Exception) {
+                    Log.e(TAG, "qwertyKey error: $e")
+                    if (warnedNullBridge.compareAndSet(false, true)) {
+
+                    }
+                }
+                i += 3
+            }
+        }
+    }
+
+    /* ---------------- NOTIFICATION ---------------- */
+
+    private fun sendNotification() {
+        val channelId = "daemon"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(channelId,
+                getString(R.string.noti_channel),
+                NotificationManager.IMPORTANCE_LOW).apply {
+                enableLights(false)
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
+            }
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                .createNotificationChannel(ch)
+        }
+
+        // Pake vector kali (kecil) buat smallIcon. iconpop.png
+        // 1536x1536 = ~9 MB Bitmap kalo di-decode -> rawan OOM di MIUI yg
+        // memang lagi ketat memory.
+        val builder = Notification.Builder(this, channelId)
+            .setContentTitle(getString(R.string.noti_title))
+            .setContentText(getString(R.string.noti_text))
+            .addAction(Notification.Action(
+                android.R.drawable.ic_delete,
+                getString(R.string.noti_action),
+                PendingIntent.getBroadcast(this, 0,
+                    Intent("intent.tuoluoyi.exit").setPackage(packageName),
+                    PendingIntent.FLAG_IMMUTABLE)))
+            .setSmallIcon(Icon.createWithResource(this, R.drawable.kali))
+            .setColor(getColor(R.color.accent_primary))
+            .setContentIntent(PendingIntent.getActivity(this, 0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE))
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+        startForeground(1, builder.build())
+    }
+
+    /* ---------------- LIFECYCLE ---------------- */
+
+    override fun onDestroy() {
+        super.onDestroy()
+        midiHandler?.removeCallbacks(rescanRunnable)
+        try {
+            deviceCallback?.let { midiManager?.unregisterDeviceCallback(it) }
+        } catch (e: Throwable) { Log.w(TAG, "unregisterDeviceCallback", e) }
+        try { midiOutputPort?.close() } catch (_: Throwable) {}
+        if (isBroadcastRegistered) {
+            try { unregisterReceiver(mBroadcastReceiver) } catch (_: Exception) {}
+        }
+        broadcastMidiDevice("")
+        try { midiThread?.quitSafely() } catch (_: Throwable) {}
+        midiThread = null
+        midiHandler = null
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent) {}
+    override fun onInterrupt() {}
+
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            try {
+                iGamePad?.qwertyKey(50, event.action == KeyEvent.ACTION_DOWN)
+            } catch (e: Throwable) { Log.w(TAG, "volumeUp -> qwertyKey", e) }
+            return true
+        }
+        return super.onKeyEvent(event)
+    }
+
+    companion object {
+        const val TAG = "PapianoMidi"
+    }
+}
