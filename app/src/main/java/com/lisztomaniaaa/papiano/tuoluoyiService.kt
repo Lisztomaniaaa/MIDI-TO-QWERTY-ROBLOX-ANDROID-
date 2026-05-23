@@ -76,6 +76,88 @@ class tuoluoyiService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * Binder yg sedang kita pegang. Disimpan supaya bisa unlinkToDeath
+     * saat ganti binder baru atau cleanup.
+     */
+    private var currentBinder: android.os.IBinder? = null
+
+    /**
+     * DeathRecipient: dipanggil oleh system INSTANT saat proses daemon mati.
+     * Ini solusi utama buat masalah "MIDI file player masih jalan tapi QWERTY
+     * gak nyala" — sebelumnya gak ada mekanisme detect binder death mid-session.
+     *
+     * Flow: daemon mati → binderDied() → cleanup iGamePad → auto-respawn →
+     * daemon baru kirim binder via broadcast → handleBinder() re-attach.
+     */
+    private val binderDeathRecipient = android.os.IBinder.DeathRecipient {
+        Log.w(TAG, "!!! BINDER DIED: daemon process killed mid-session. " +
+                "Auto-respawning...")
+
+        // Cleanup state di main thread supaya thread-safe dgn broadcast receiver
+        mainHandler.post {
+            iGamePad = null
+            isGamePadCreated = false
+            currentBinder = null
+            warnedNullBridge.set(false)
+
+            // Broadcast status ke floating panel supaya UI tau bridge putus
+            try {
+                sendBroadcast(Intent("intent.tuoluoyi.bridge_status")
+                    .setPackage(packageName)
+                    .putExtra("alive", false))
+            } catch (_: Throwable) {}
+
+            // Auto-respawn daemon
+            respawnDaemon()
+
+            // Safety net: kalau setelah 8 detik masih null (respawn gagal),
+            // coba sekali lagi. Ini handle case di mana Shizuku lagi restart
+            // atau system lagi sibuk.
+            mainHandler.postDelayed({
+                if (iGamePad == null) {
+                    Log.w(TAG, "Post-death respawn: still null after 8s, retry...")
+                    respawnDaemon()
+                }
+            }, 8000L)
+        }
+    }
+
+    /**
+     * Periodic bridge health check. Jalan TERUS selama service hidup (bukan
+     * cuma sekali di onServiceConnected). Interval 15 detik. Detect case di
+     * mana DeathRecipient miss (rare, tapi possible kalau binder proxy udah
+     * di-GC sebelum daemon mati) atau daemon hang tanpa crash.
+     */
+    private val bridgeHealthRunnable: Runnable = object : Runnable {
+        override fun run() {
+            try { checkBridgeHealth() } catch (e: Throwable) {
+                Log.e(TAG, "bridgeHealth", e)
+            } finally {
+                mainHandler.postDelayed(this, BRIDGE_HEALTH_INTERVAL)
+            }
+        }
+    }
+
+    /**
+     * Cek apakah bridge masih hidup. Kalau iGamePad != null tapi binder-nya
+     * dead (pingBinder() false), force cleanup + respawn.
+     */
+    private fun checkBridgeHealth() {
+        val gp = iGamePad ?: return // null = belum pernah connect ATAU udah di-handle DeathRecipient
+        val binder = currentBinder
+        if (binder == null || !binder.pingBinder()) {
+            Log.w(TAG, "Bridge health check: binder dead/unreachable. Cleaning up + respawn.")
+            // Binder sudah mati tapi DeathRecipient gak ke-trigger (rare case)
+            iGamePad = null
+            isGamePadCreated = false
+            try { binder?.unlinkToDeath(binderDeathRecipient, 0) } catch (_: Throwable) {}
+            currentBinder = null
+            warnedNullBridge.set(false)
+            respawnDaemon()
+        }
+    }
+
     /** Worker thread khusus buat semua MIDI binder ops. Dilahirin di onServiceConnected. */
     private var midiThread: HandlerThread? = null
     private var midiHandler: Handler? = null
@@ -135,15 +217,34 @@ class tuoluoyiService : AccessibilityService() {
         val raw = extractBinder(intent)
         if (raw == null) {
             Log.w(TAG, "handleBinder: extractBinder returned null")
-
             return
         }
         if (!raw.pingBinder()) {
             Log.w(TAG, "handleBinder: binder dead (ping failed)")
-
             return
         }
         val binder: android.os.IBinder = raw
+
+        // Unlink DeathRecipient dari binder LAMA (kalau ada) sebelum attach yg baru.
+        // Tanpa ini, kalau daemon respawn dan kirim binder baru, kita masih listen
+        // ke binder lama yg udah dead → leak + false trigger.
+        try { currentBinder?.unlinkToDeath(binderDeathRecipient, 0) } catch (_: Throwable) {}
+
+        // Register DeathRecipient ke binder BARU. Ini yang detect instant
+        // kalau daemon mati di tengah playback → auto-respawn.
+        try {
+            binder.linkToDeath(binderDeathRecipient, 0)
+            currentBinder = binder
+            Log.d(TAG, "DeathRecipient linked to new daemon binder")
+        } catch (e: RemoteException) {
+            // linkToDeath throws RemoteException kalau binder UDAH dead
+            // saat kita coba link. Ini berarti daemon mati antara extractBinder
+            // dan sekarang — langsung respawn.
+            Log.e(TAG, "linkToDeath failed (already dead), respawning...", e)
+            currentBinder = null
+            respawnDaemon()
+            return
+        }
 
         iGamePad = IGamePad.Stub.asInterface(binder)
         try {
@@ -151,16 +252,20 @@ class tuoluoyiService : AccessibilityService() {
             isGamePadCreated = iGamePad?.create() == true
         } catch (e: RemoteException) {
             Log.e(TAG, "changeMode/create", e)
-
         }
 
         if (isGamePadCreated) {
             Log.d(TAG, "Virtual HID ready, MIDI bridge live")
             warnedNullBridge.set(false)
 
+            // Broadcast status ke floating panel: bridge is alive
+            try {
+                sendBroadcast(Intent("intent.tuoluoyi.bridge_status")
+                    .setPackage(packageName)
+                    .putExtra("alive", true))
+            } catch (_: Throwable) {}
         } else {
             Log.e(TAG, "Virtual HID create FAILED (uHID open needs root/shell perm)")
-
             try { iGamePad?.closeAndExit() } catch (_: RemoteException) {}
             iGamePad = null
         }
@@ -271,6 +376,13 @@ class tuoluoyiService : AccessibilityService() {
                 }, 5000L)
             }
         }, 6000L)
+
+        // Start periodic bridge health check. Jalan TERUS setiap 15 detik
+        // selama service hidup. Ini safety net kedua di atas DeathRecipient
+        // — detect kasus di mana binder proxy di-GC atau daemon hang tanpa
+        // crash (gak trigger binderDied). Tanpa ini, kalau DeathRecipient
+        // miss, user stuck sampai restart app manual.
+        mainHandler.postDelayed(bridgeHealthRunnable, BRIDGE_HEALTH_INTERVAL)
 
         // Floating panel auto-on: kalau user udah granting SYSTEM_ALERT_WINDOW
         // DAN belum dismiss panel via tombol ✕, hidupin panel pas accessibility
@@ -647,6 +759,13 @@ class tuoluoyiService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // Stop periodic health checks
+        mainHandler.removeCallbacks(bridgeHealthRunnable)
+
+        // Unlink DeathRecipient dari binder daemon
+        try { currentBinder?.unlinkToDeath(binderDeathRecipient, 0) } catch (_: Throwable) {}
+        currentBinder = null
+
         midiHandler?.removeCallbacks(rescanRunnable)
         try {
             deviceCallback?.let { midiManager?.unregisterDeviceCallback(it) }
@@ -676,5 +795,7 @@ class tuoluoyiService : AccessibilityService() {
 
     companion object {
         const val TAG = "PapianoMidi"
+        /** Interval periodic bridge health check (milliseconds). */
+        const val BRIDGE_HEALTH_INTERVAL = 15_000L
     }
 }
