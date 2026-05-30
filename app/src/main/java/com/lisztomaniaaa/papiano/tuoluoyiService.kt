@@ -108,6 +108,7 @@ class tuoluoyiService : AccessibilityService() {
         // Cleanup state di main thread supaya thread-safe dgn broadcast receiver
         mainHandler.post {
             iGamePad = null
+            GamePadBridge.gamePad = null
             isGamePadCreated = false
             currentBinder = null
             warnedNullBridge.set(false)
@@ -161,6 +162,7 @@ class tuoluoyiService : AccessibilityService() {
             Log.w(TAG, "Bridge health check: binder dead/unreachable. Cleaning up + respawn.")
             // Binder sudah mati tapi DeathRecipient gak ke-trigger (rare case)
             iGamePad = null
+            GamePadBridge.gamePad = null
             isGamePadCreated = false
             try { binder?.unlinkToDeath(binderDeathRecipient, 0) } catch (_: Throwable) {}
             currentBinder = null
@@ -225,6 +227,7 @@ class tuoluoyiService : AccessibilityService() {
                         // hot-path + persist biar konsisten lintas komponen.
                         val enabled = intent.getBooleanExtra("enabled", false)
                         velocityEnabled = enabled
+                        GamePadBridge.velocityEnabled = enabled
                         try { sp?.edit()?.putBoolean("velocity_enabled", enabled)?.apply() }
                         catch (_: Throwable) {}
                         Log.d(TAG, "velocityEnabled = $enabled")
@@ -281,6 +284,10 @@ class tuoluoyiService : AccessibilityService() {
             Log.d(TAG, "Virtual HID ready, MIDI bridge live")
             warnedNullBridge.set(false)
 
+            // Publish live binder for direct (no-broadcast) note delivery.
+            GamePadBridge.gamePad = iGamePad
+            GamePadBridge.velocityEnabled = velocityEnabled
+
             // Broadcast status ke floating panel: bridge is alive
             try {
                 sendBroadcast(Intent("intent.tuoluoyi.bridge_status")
@@ -291,6 +298,7 @@ class tuoluoyiService : AccessibilityService() {
             Log.e(TAG, "Virtual HID create FAILED (uHID open needs root/shell perm)")
             try { iGamePad?.closeAndExit() } catch (_: RemoteException) {}
             iGamePad = null
+            GamePadBridge.gamePad = null
         }
     }
 
@@ -338,6 +346,7 @@ class tuoluoyiService : AccessibilityService() {
         sp = getSharedPreferences("data", 0)
         // Restore velocity toggle state (default OFF).
         velocityEnabled = sp?.getBoolean("velocity_enabled", false) ?: false
+        GamePadBridge.velocityEnabled = velocityEnabled
 
         // Start MIDI worker thread DULU sebelum apa pun yg mungkin nge-block.
         if (midiThread == null) {

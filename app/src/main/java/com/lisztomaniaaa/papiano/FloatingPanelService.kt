@@ -364,8 +364,24 @@ class FloatingPanelService : Service() {
         if (midiFilePlayer == null) {
             midiFilePlayer = MidiFilePlayer()
             midiFilePlayer?.setNoteCallback { noteNumber, isDown, velocity ->
+                if (noteNumber < 21 || noteNumber > 107) return@setNoteCallback
+                // FAST PATH: call the daemon binder directly (no broadcast hop).
+                // The old sendBroadcast route went through ActivityManager and
+                // added tens of ms latency + jitter per note. qwertyKey is
+                // oneway so this returns immediately.
+                val gp = GamePadBridge.gamePad
+                if (gp != null) {
+                    try {
+                        val v = if (GamePadBridge.velocityEnabled && isDown) velocity else 0
+                        gp.qwertyKey(noteNumber, isDown, v)
+                        return@setNoteCallback
+                    } catch (_: Throwable) {
+                        // stale/dead binder mid-respawn — fall through to broadcast
+                    }
+                }
+                // FALLBACK: bridge not ready (daemon connecting/respawning).
+                // tuoluoyiService receives this and applies gating + calls binder.
                 try {
-                    if (noteNumber < 21 || noteNumber > 107) return@setNoteCallback
                     sendBroadcast(Intent("intent.tuoluoyi.midi_file_note")
                         .setPackage(packageName)
                         .putExtra("note", noteNumber)
