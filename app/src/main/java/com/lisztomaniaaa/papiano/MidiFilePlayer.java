@@ -30,7 +30,7 @@ public class MidiFilePlayer {
     private static final String TAG = "MidiFilePlayer";
 
     public interface NoteCallback {
-        void onNote(int noteNumber, boolean isDown);
+        void onNote(int noteNumber, boolean isDown, int velocity);
     }
 
     public interface StateCallback {
@@ -45,12 +45,14 @@ public class MidiFilePlayer {
         int note;
         boolean isDown;
         int channel;
+        int velocity; // 0..127 (MIDI note-on velocity; 0 for note-off)
 
-        NoteEvent(long tick, int note, boolean isDown, int channel) {
+        NoteEvent(long tick, int note, boolean isDown, int channel, int velocity) {
             this.absoluteTick = tick;
             this.note = note;
             this.isDown = isDown;
             this.channel = channel;
+            this.velocity = velocity;
         }
     }
 
@@ -157,7 +159,7 @@ public class MidiFilePlayer {
         // Release all held notes
         if (noteCallback != null) {
             for (int n = 21; n <= 107; n++) {
-                noteCallback.onNote(n, false);
+                noteCallback.onNote(n, false, 0);
             }
         }
         if (stateCallback != null) stateCallback.onPlaybackStopped();
@@ -175,7 +177,7 @@ public class MidiFilePlayer {
             if (stateCallback != null) stateCallback.onPlaybackStopped();
             // Release all
             if (noteCallback != null) {
-                for (int n = 21; n <= 107; n++) noteCallback.onNote(n, false);
+                for (int n = 21; n <= 107; n++) noteCallback.onNote(n, false, 0);
             }
             return;
         }
@@ -198,7 +200,7 @@ public class MidiFilePlayer {
             if (current.channel == 9) {
                 // Skip percussion channel — note numbers mean different instruments, not piano keys
             } else if (filter == -1 || current.channel == filter) {
-                noteCallback.onNote(current.note, current.isDown);
+                noteCallback.onNote(current.note, current.isDown, current.velocity);
             }
         }
         currentEventIndex++;
@@ -346,7 +348,8 @@ public class MidiFilePlayer {
                         int note = data[pos++] & 0xFF;
                         int vel = data[pos++] & 0xFF;
                         boolean isDown = (cmd == 0x90) && (vel > 0);
-                        allEvents.add(new NoteEvent(absoluteTick, note, isDown, channel));
+                        allEvents.add(new NoteEvent(absoluteTick, note, isDown, channel,
+                                isDown ? vel : 0));
                     } else if (cmd == 0xA0 || cmd == 0xB0 || cmd == 0xE0) {
                         pos += 2; // 2-byte events
                     } else if (cmd == 0xC0 || cmd == 0xD0) {

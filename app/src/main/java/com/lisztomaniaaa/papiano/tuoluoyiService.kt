@@ -54,6 +54,17 @@ class tuoluoyiService : AccessibilityService() {
     private var isGamePadCreated = false
     private var sp: SharedPreferences? = null
 
+    /**
+     * Velocity ("Visual Piano") toggle. Saat true, velocity not dikirim ke
+     * native (yang akan tap Alt+velKey skema 32-step sebelum not). Saat false,
+     * kita kirim velocity=0 -> native main QWERTY polos. State disimpan di
+     * pref "velocity_enabled" dan di-update live via broadcast
+     * "intent.tuoluoyi.set_velocity". Hot-path (per-not), jadi @Volatile field
+     * dibaca langsung tanpa nyentuh SharedPreferences tiap not.
+     */
+    @Volatile
+    private var velocityEnabled = false
+
     private var midiManager: MidiManager? = null
     private var deviceCallback: MidiManager.DeviceCallback? = null
     private var midiOutputPort: MidiOutputPort? = null
@@ -201,10 +212,22 @@ class tuoluoyiService : AccessibilityService() {
                         // MIDI file player note event — forward to daemon
                         val note = intent.getIntExtra("note", -1)
                         val down = intent.getBooleanExtra("down", false)
+                        val vel = intent.getIntExtra("vel", 0)
                         if (note in 21..107) {
-                            try { iGamePad?.qwertyKey(note, down) }
+                            // velocity dikirim hanya saat toggle ON & note-on.
+                            val v = if (velocityEnabled && down) vel else 0
+                            try { iGamePad?.qwertyKey(note, down, v) }
                             catch (_: Throwable) {}
                         }
+                    }
+                    "intent.tuoluoyi.set_velocity" -> {
+                        // Toggle velocity dari UI (home / popup). Update field
+                        // hot-path + persist biar konsisten lintas komponen.
+                        val enabled = intent.getBooleanExtra("enabled", false)
+                        velocityEnabled = enabled
+                        try { sp?.edit()?.putBoolean("velocity_enabled", enabled)?.apply() }
+                        catch (_: Throwable) {}
+                        Log.d(TAG, "velocityEnabled = $enabled")
                     }
                 }
             } catch (t: Throwable) {
@@ -313,6 +336,8 @@ class tuoluoyiService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         sp = getSharedPreferences("data", 0)
+        // Restore velocity toggle state (default OFF).
+        velocityEnabled = sp?.getBoolean("velocity_enabled", false) ?: false
 
         // Start MIDI worker thread DULU sebelum apa pun yg mungkin nge-block.
         if (midiThread == null) {
@@ -328,6 +353,7 @@ class tuoluoyiService : AccessibilityService() {
                 addAction("intent.tuoluoyi.exit")
                 addAction("intent.tuoluoyi.midi_request")
                 addAction("intent.tuoluoyi.midi_file_note")
+                addAction("intent.tuoluoyi.set_velocity")
             }
             ContextCompat.registerReceiver(this, mBroadcastReceiver,
                 internalFilter,
@@ -703,7 +729,9 @@ class tuoluoyiService : AccessibilityService() {
                 }
 
                 try {
-                    gp.qwertyKey(noteNumber, isPress)
+                    // velocity dikirim hanya saat toggle ON & note-on (press).
+                    val v = if (velocityEnabled && isPress) velocity else 0
+                    gp.qwertyKey(noteNumber, isPress, v)
                 } catch (e: Exception) {
                     Log.e(TAG, "qwertyKey error: $e")
                     if (warnedNullBridge.compareAndSet(false, true)) {
@@ -786,7 +814,7 @@ class tuoluoyiService : AccessibilityService() {
     override fun onKeyEvent(event: KeyEvent): Boolean {
         if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
             try {
-                iGamePad?.qwertyKey(50, event.action == KeyEvent.ACTION_DOWN)
+                iGamePad?.qwertyKey(50, event.action == KeyEvent.ACTION_DOWN, 0)
             } catch (e: Throwable) { Log.w(TAG, "volumeUp -> qwertyKey", e) }
             return true
         }

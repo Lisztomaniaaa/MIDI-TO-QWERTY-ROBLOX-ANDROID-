@@ -162,7 +162,7 @@ public class GamePadNative {
     static native boolean nativeCloseUHid();
 
 
-    static native void nativeQwertyKey(int noteNumber, boolean isDown);
+    static native void nativeQwertyKey(int noteNumber, boolean isDown, int velocity);
 
     static native void nativePianoRoomsKey(int[] noteIntArray);
 
@@ -172,7 +172,7 @@ public class GamePadNative {
             //生成binder
             IBinder binder = new IGamePad.Stub() {
                 @Override
-                public void qwertyKey(int noteNumber, boolean isDown) throws RemoteException {
+                public void qwertyKey(int noteNumber, boolean isDown, int velocity) throws RemoteException {
 //                    int status = 500;
                     // Do something!
 
@@ -180,7 +180,12 @@ public class GamePadNative {
                     //   isDown=true  -> add note to held set, emit aggregated HID report
                     //   isDown=false -> remove note from held set, emit updated report
                     // Limit 6KRO (HID boot-protocol). Lihat native-lib.cpp utk detail.
-                    nativeQwertyKey(noteNumber, isDown);
+                    //
+                    // velocity: 0 = velocity OFF (QWERTY polos). >0 = Visual Piano
+                    // velocity mode -> native akan tap Alt+<velKey> (skema 32-step)
+                    // sebelum not kalau level velocity berubah. Gating ON/OFF
+                    // dilakukan di tuoluoyiService (kirim 0 saat toggle OFF).
+                    nativeQwertyKey(noteNumber, isDown, velocity);
 
 //                    if (isDown) {
 //                        //Log.d(MainActivity.TAG, "Key: " + Hid.keyboardCode[2])

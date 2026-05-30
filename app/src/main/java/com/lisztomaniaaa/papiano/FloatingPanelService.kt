@@ -33,6 +33,7 @@ import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.RemoteViews
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
@@ -84,6 +85,7 @@ class FloatingPanelService : Service() {
     private var btnMidiStop: ImageView? = null
     private var sbSpeed: SeekBar? = null
     private var tvSpeedValue: TextView? = null
+    private var swVelocity: Switch? = null
     private var filePickerPending = false
 
     companion object {
@@ -334,6 +336,23 @@ class FloatingPanelService : Service() {
         btnMidiStop = view.findViewById(R.id.btn_midi_stop)
         sbSpeed = view.findViewById(R.id.sb_speed)
         tvSpeedValue = view.findViewById(R.id.tv_speed_value)
+        swVelocity = view.findViewById(R.id.sw_velocity)
+
+        // Velocity toggle ("Visual Piano" dynamics). State shared dgn home
+        // screen via pref "velocity_enabled". Broadcast ke tuoluoyiService
+        // biar update live.
+        swVelocity?.setOnCheckedChangeListener(null) // clear before set (re-inflate safe)
+        swVelocity?.isChecked = sp.getBoolean("velocity_enabled", false)
+        swVelocity?.setOnCheckedChangeListener { _, checked ->
+            sp.edit().putBoolean("velocity_enabled", checked).apply()
+            try {
+                sendBroadcast(Intent("intent.tuoluoyi.set_velocity")
+                    .setPackage(packageName)
+                    .putExtra("enabled", checked))
+            } catch (t: Throwable) {
+                Log.w(TAG, "broadcast set_velocity", t)
+            }
+        }
 
         val saved = sp.getInt(KEY_OPACITY, DEFAULT_OPACITY)
         sbOpacity?.progress = saved
@@ -344,13 +363,14 @@ class FloatingPanelService : Service() {
         // Init MIDI player
         if (midiFilePlayer == null) {
             midiFilePlayer = MidiFilePlayer()
-            midiFilePlayer?.setNoteCallback { noteNumber, isDown ->
+            midiFilePlayer?.setNoteCallback { noteNumber, isDown, velocity ->
                 try {
                     if (noteNumber < 21 || noteNumber > 107) return@setNoteCallback
                     sendBroadcast(Intent("intent.tuoluoyi.midi_file_note")
                         .setPackage(packageName)
                         .putExtra("note", noteNumber)
-                        .putExtra("down", isDown))
+                        .putExtra("down", isDown)
+                        .putExtra("vel", velocity))
                 } catch (_: Throwable) {}
             }
             midiFilePlayer?.setStateCallback(object : MidiFilePlayer.StateCallback {

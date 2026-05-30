@@ -443,6 +443,64 @@ static void emitHeldReport() {
 
 
 // ============================================================================
+// VELOCITY ("Visual Piano" / MIDI++ style) — Alt + velocity-key, 32 steps
+// ----------------------------------------------------------------------------
+// Game piano tertentu (Visual Piano, Piano Gardens, dll) menerima velocity
+// lewat keypress TERPISAH: tap `Alt + <key>` untuk SET level velocity, lalu
+// notnya ditekan biasa. Game inget level itu sampai diganti.
+//
+// Skema diambil dari MIDI++ (Zephkek/MIDIPlusPlus): 32 level, dipetakan ke
+// deret tombol di bawah (pelan -> keras). MIDI velocity 0..127 dipetakan
+// linear ke index 0..31. velKey CUMA dikirim ulang saat level berubah
+// (lihat g_lastVelHex) — biar gak spam keypress tiap not.
+//
+// LeftAlt = bit 2 di modifier byte = 0x04 (sejajar LeftCtrl=0x01, Shift=0x02).
+// ============================================================================
+static const int MOD_LEFTALT = 0x04;
+
+// HID usage code utk tiap velocity-key, index 0..31:
+//   1 2 3 4 5 6 7 8 9 0  q w e r t y u i o p  a s d f g h j k l  z x c
+static const int g_velKeyHex[32] = {
+    0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, // 1..0
+    0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C, 0x12, 0x13, // q w e r t y u i o p
+    0x04, 0x16, 0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F,       // a s d f g h j k l
+    0x1D, 0x1B, 0x06                                            // z x c
+};
+
+// velKey terakhir yg di-emit (-1 = belum ada). Reset di nativeCloseUHid.
+static int g_lastVelHex = -1;
+
+// MIDI velocity (1..127) -> velocity-key index (0..31), linear.
+static inline int velocityToIndex(int velocity) {
+    int idx = (velocity * 32) / 128;
+    if (idx < 0) idx = 0;
+    if (idx > 31) idx = 31;
+    return idx;
+}
+
+// Kirim command "Alt + velKey" TANPA nge-release not yg lagi di-hold.
+// Not yg di-hold dimasukin ke report yg sama biar tetep down (Roblox fire
+// InputBegan cuma pas keycode transisi up->down; nambah modifier Alt
+// sementara TIDAK nge-retrigger not yg udah down). velKey dapet transisi
+// down->up fresh, jadi handler Alt+key velocity di game ke-trigger.
+// Held note yg kebetulan pakai hex sama dgn velKey di-skip biar gak dobel.
+// Caller MUST hold g_heldMutex.
+static void tapVelocityKey(int velHex) {
+    int keys[HID_MAX_KEYS] = {0, 0, 0, 0, 0, 0};
+    size_t k = 0;
+    // sisakan 1 slot utk velKey (max 5 held note ikut)
+    for (size_t i = 0; i < g_heldKeys.size() && k < HID_MAX_KEYS - 1; i++) {
+        if (g_heldKeys[i].hex == velHex) continue; // hindari duplikat keycode
+        keys[k++] = g_heldKeys[i].hex;
+    }
+    keys[k++] = velHex;
+    writeKeyboard(MOD_LEFTALT, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]);
+    // restore: Alt + velKey dilepas, not yg di-hold tetep down
+    emitHeldReport();
+}
+
+
+// ============================================================================
 // ZERO-ALLOCATION LOOKUP TABLE for nativeQwertyKey hot path
 // ----------------------------------------------------------------------------
 // Precomputed from pianoQwertyKeys + qwerty_to_hex_map + meta_key_map.
@@ -640,6 +698,7 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCloseUHid(JNIEnv *env, jclass
     {
         std::lock_guard<std::mutex> lock(g_heldMutex);
         g_heldKeys.clear();
+        g_lastVelHex = -1; // reset velocity level tracking
     }
 
     struct uhid_event ev;
@@ -657,7 +716,8 @@ JNIEXPORT void JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
                                                      jclass thiz,
                                                      jint noteNumber,
-                                                     jboolean isDown) {
+                                                     jboolean isDown,
+                                                     jint velocity) {
     if (!(noteNumber >= 21 && noteNumber <= 107)) {
         return; // silent drop — no log on hot path
     }
@@ -671,6 +731,19 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
         // Dedupe: skip if already held
         for (const auto& h : g_heldKeys) {
             if (h.note == noteNumber) return;
+        }
+
+        // VELOCITY: velocity>0 artinya Visual Piano velocity mode aktif untuk
+        // event ini (gating ON/OFF dilakukan di tuoluoyiService — OFF kirim 0).
+        // Tap Alt+velKey SEBELUM not ditekan, dan cuma kalau level berubah.
+        // Dilakukan sebelum push not baru supaya tapVelocityKey cuma bawa not
+        // yg lagi bener-bener di-hold (bukan not baru ini).
+        if (velocity > 0) {
+            int velHex = g_velKeyHex[velocityToIndex(velocity)];
+            if (velHex != g_lastVelHex) {
+                g_lastVelHex = velHex;
+                tapVelocityKey(velHex);
+            }
         }
 
         // Meta collision fix: if new note has a DIFFERENT modifier than

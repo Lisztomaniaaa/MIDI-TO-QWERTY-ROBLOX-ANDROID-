@@ -247,6 +247,52 @@
                 android:thumbTint="@color/accent_secondary"
                 android:layout_marginTop="2dp" />
 
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#FF222222"
+                android:layout_marginTop="8dp"
+                android:layout_marginBottom="8dp" />
+
+            <!-- VELOCITY toggle -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:layout_marginEnd="8dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="VELOCITY"
+                        android:textColor="#FF9CA3AF"
+                        android:textSize="9sp"
+                        android:letterSpacing="0.12" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Visual Piano dynamics"
+                        android:textColor="@color/text_muted"
+                        android:textSize="10sp"
+                        android:layout_marginTop="1dp" />
+                </LinearLayout>
+
+                <Switch
+                    android:id="@+id/sw_velocity"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:thumbTint="@color/accent_glow"
+                    android:trackTint="@color/text_muted" />
+            </LinearLayout>
+
 
 
             <View

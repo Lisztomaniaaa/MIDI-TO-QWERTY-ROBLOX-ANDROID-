@@ -25,6 +25,7 @@ import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Log;
 import android.widget.Button;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -278,6 +279,22 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton(R.string.cancel, null)
                 .show());
+
+        // Velocity toggle ("Visual Piano" dynamics). Persist ke pref
+        // "velocity_enabled" + broadcast ke tuoluoyiService biar update live
+        // tanpa restart service.
+        Switch swVelocity = findViewById(R.id.sw_velocity);
+        swVelocity.setChecked(sp.getBoolean("velocity_enabled", false));
+        swVelocity.setOnCheckedChangeListener((btn, checked) -> {
+            sp.edit().putBoolean("velocity_enabled", checked).apply();
+            try {
+                sendBroadcast(new Intent("intent.tuoluoyi.set_velocity")
+                        .setPackage(getPackageName())
+                        .putExtra("enabled", checked));
+            } catch (Throwable t) {
+                Log.w(TAG, "broadcast set_velocity", t);
+            }
+        });
     }
 
     /* ---------------- PERMISSION ---------------- */
