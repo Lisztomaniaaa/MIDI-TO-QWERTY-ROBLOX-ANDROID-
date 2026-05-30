@@ -24,6 +24,7 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <sys/resource.h>
 
 static int uhid_fd;
 static struct uhid_event uhidEvent;
@@ -720,6 +721,22 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
                                                      jint velocity) {
     if (!(noteNumber >= 21 && noteNumber <= 107)) {
         return; // silent drop — no log on hot path
+    }
+
+    // Latency/jitter: daemon nanganin note event lewat binder oneway dari MIDI
+    // dispatcher. Binder pakai thread POOL, jadi boost dilakukan PER-THREAD
+    // (thread_local) sekali doang tiap binder thread yg pernah ngelayanin not.
+    // Naikin nice ke -19 (setara URGENT_AUDIO) biar thread injeksi HID gak
+    // kena preempt → ngurangin jitter di sisi daemon.
+    //
+    // setpriority(PRIO_PROCESS, 0, ...) di Linux = nice thread pemanggil
+    // (nice itu per-task). CUMA nice value, bukan RT scheduling → gak bisa
+    // nge-starve sistem. Kalau proses gak punya CAP_SYS_NICE, panggilan gagal
+    // graceful (return -1) tanpa efek samping — thread tetap di prioritas normal.
+    static thread_local bool t_prioBoosted = false;
+    if (!t_prioBoosted) {
+        t_prioBoosted = true;
+        setpriority(PRIO_PROCESS, 0, -19);
     }
 
     // Zero-allocation lookup: direct array index, no string, no hash

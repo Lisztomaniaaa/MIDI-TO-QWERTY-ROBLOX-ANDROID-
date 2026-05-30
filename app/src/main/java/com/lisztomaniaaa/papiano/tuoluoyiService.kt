@@ -685,8 +685,28 @@ class tuoluoyiService : AccessibilityService() {
         private val NOTE_OFF = 0x80
         private val ALIVE: Byte = 0xFE.toByte()
 
+        /**
+         * Latency/jitter: onSend SELALU dipanggil di thread dispatcher internal
+         * MidiOutputPort yang sama. Default-nya thread itu prioritas normal,
+         * jadi bisa kena preempt scheduler → not telat sesekali (jitter).
+         * Sekali doang (flag di bawah) kita naikin prioritas thread itu ke
+         * URGENT_AUDIO (nice -19, sama kelas dgn thread audio low-latency).
+         *
+         * Ini CUMA nice value, BUKAN SCHED_FIFO/real-time → gak bisa nge-starve
+         * sistem, otomatis balik normal pas proses mati. Kalau OS nolak,
+         * try/catch nelen errornya tanpa efek samping (zona aman).
+         */
+        private var priorityBoosted = false
+
         @Throws(IOException::class)
         override fun onSend(data: ByteArray, offset: Int, count: Int, timestamp: Long) {
+            if (!priorityBoosted) {
+                priorityBoosted = true
+                try {
+                    android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                } catch (_: Throwable) {}
+            }
             if (count == 0 || data[offset] == ALIVE) return
 
             var i = offset
