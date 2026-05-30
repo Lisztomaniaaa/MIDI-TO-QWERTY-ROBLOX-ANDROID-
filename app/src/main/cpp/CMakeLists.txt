@@ -23,6 +23,20 @@ add_library( # Sets the name of the library.
         # Provides a relative path to your source file(s).
         native-lib.cpp)
 
+# Latency: force full optimization on the HID injection hot path regardless of
+# build variant. The per-note path (nativeQwertyKey -> emitHeldReport -> write)
+# must be as tight as possible; -O3 lets the compiler inline the lookup-table
+# access and report assembly. Section GC trims unused code so the daemon stays
+# small and warm in cache.
+target_compile_options(tuoluoyi PRIVATE
+        -O3
+        -fvisibility=hidden
+        -ffunction-sections
+        -fdata-sections)
+
+target_link_options(tuoluoyi PRIVATE
+        -Wl,--gc-sections)
+
 # Searches for a specified prebuilt library and stores the path as a
 # variable. Because CMake includes system libraries in the search path by
 # default, you only need to specify the name of the public NDK library

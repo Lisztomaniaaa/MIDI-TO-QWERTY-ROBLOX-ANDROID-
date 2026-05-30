@@ -2,6 +2,7 @@ package com.lisztomaniaaa.papiano;
 
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.IOException;
@@ -24,6 +25,22 @@ import java.util.List;
  * - Auto-clamp to note range 21-107
  * - Tempo map (handles mid-song tempo changes correctly)
  * - Channel filter (default: channel 0 only, configurable)
+ *
+ * LATENCY / TIMING DESIGN (drift-free, low-jitter):
+ *   Setiap event punya {@link NoteEvent#timeMs} = posisi absolut (ms, di
+ *   kecepatan 1.0x) yang dihitung sekali pas parse via tempo map. Saat play,
+ *   kita pasang ANCHOR (anchorWallMs, anchorMusicMs). Target wall-clock tiap
+ *   event = anchorWallMs + (timeMs - anchorMusicMs) / speed. Karena target
+ *   selalu dihitung dari anchor TETAP + waktu musik SEBENARNYA event, error
+ *   pemrosesan per-not TIDAK menumpuk -> gak ada drift yang makin lama makin
+ *   telat (penyebab utama "latency makin kerasa" di playback panjang).
+ *
+ *   pump() nge-drain semua event yang udah jatuh tempo dalam satu loop ketat
+ *   (chord ke-fire back-to-back tanpa hop message-queue), lalu jadwalin pump
+ *   berikutnya TEPAT di target absolut event berikutnya via postAtTime.
+ *
+ *   Thread "midi-player" di-boost ke URGENT_AUDIO (nice -19) sekali di awal
+ *   supaya callback timing gak kena preempt scheduler (ngurangin jitter).
  */
 public class MidiFilePlayer {
 
@@ -42,6 +59,7 @@ public class MidiFilePlayer {
     // Parsed note event
     private static class NoteEvent {
         long absoluteTick;
+        long timeMs;        // absolute time from song start at 1.0x speed (ms)
         int note;
         boolean isDown;
         int channel;
@@ -82,19 +100,61 @@ public class MidiFilePlayer {
     private int currentEventIndex = 0;
     private String fileName = "";
 
+    // ── Drift-free playback timeline anchor (read/written on the player thread) ──
+    private long anchorWallMs = 0;   // SystemClock.uptimeMillis() at anchor
+    private long anchorMusicMs = 0;  // music time (ms @1.0x) corresponding to anchor
+    private long lastProgressMs = 0; // throttle progress callback
+    private boolean priorityBoosted = false;
+
+    /** Single reusable runnable so postAtTime / removeCallbacks stay consistent. */
+    private final Runnable pumpRunnable = this::pump;
+
     /** Channel filter: -1 = all channels, 0-15 = specific channel.
      *  Default -1 plays all channels EXCEPT channel 9 (drums/percussion). */
     private volatile int channelFilter = -1;
 
     public MidiFilePlayer() {
-        thread = new HandlerThread("midi-player");
+        // Boost the timing thread to URGENT_AUDIO at creation so playback
+        // callbacks fire with minimal scheduler jitter. The HandlerThread
+        // priority constructor sets it from inside the thread; if the OS
+        // refuses the negative nice it degrades gracefully (no crash).
+        thread = new HandlerThread("midi-player",
+                android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
         thread.start();
         handler = new Handler(thread.getLooper());
     }
 
     public void setNoteCallback(NoteCallback cb) { this.noteCallback = cb; }
     public void setStateCallback(StateCallback cb) { this.stateCallback = cb; }
-    public void setSpeed(float speed) { this.speedMultiplier = Math.max(0.25f, Math.min(2.0f, speed)); }
+
+    /**
+     * Change playback speed. If currently playing, re-anchor on the player
+     * thread so the new speed takes effect from "now" without a time jump and
+     * without reintroducing drift.
+     */
+    public void setSpeed(float speed) {
+        final float clamped = Math.max(0.25f, Math.min(2.0f, speed));
+        if (handler != null && isPlaying) {
+            handler.post(() -> {
+                if (isPlaying) {
+                    long now = SystemClock.uptimeMillis();
+                    // current music position under the OLD speed
+                    long musicNow = anchorMusicMs
+                            + (long) ((now - anchorWallMs) * speedMultiplier);
+                    speedMultiplier = clamped;
+                    anchorMusicMs = musicNow;
+                    anchorWallMs = now;
+                    handler.removeCallbacks(pumpRunnable);
+                    pump();
+                } else {
+                    speedMultiplier = clamped;
+                }
+            });
+        } else {
+            speedMultiplier = clamped;
+        }
+    }
+
     public float getSpeed() { return speedMultiplier; }
     public void setChannelFilter(int ch) { this.channelFilter = ch; }
     public int getChannelFilter() { return channelFilter; }
@@ -130,10 +190,12 @@ public class MidiFilePlayer {
     public void play() {
         if (events.isEmpty()) return;
         if (isPaused) {
+            // Resume: re-anchor to the next unfired event so playback continues
+            // seamlessly regardless of how long we were paused.
             isPaused = false;
             isPlaying = true;
-            scheduleNext();
             if (stateCallback != null) stateCallback.onPlaybackStarted();
+            handler.post(() -> { reanchorToCurrent(); pump(); });
             return;
         }
         stop();
@@ -141,7 +203,7 @@ public class MidiFilePlayer {
         isPaused = false;
         currentEventIndex = 0;
         if (stateCallback != null) stateCallback.onPlaybackStarted();
-        scheduleNext();
+        handler.post(() -> { reanchorToCurrent(); pump(); });
     }
 
     public void pause() {
@@ -170,64 +232,88 @@ public class MidiFilePlayer {
         thread.quitSafely();
     }
 
-    private void scheduleNext() {
-        if (!isPlaying || currentEventIndex >= events.size()) {
-            // Playback finished
-            isPlaying = false;
-            if (stateCallback != null) stateCallback.onPlaybackStopped();
-            // Release all
-            if (noteCallback != null) {
-                for (int n = 21; n <= 107; n++) noteCallback.onNote(n, false, 0);
-            }
-            return;
-        }
+    // ═══════════════════════════════════════════════════════════════
+    // PLAYBACK ENGINE — drift-free absolute-time scheduler
+    // ═══════════════════════════════════════════════════════════════
 
-        handler.post(this::playNextBatch);
+    /** Anchor the timeline so the next event fires immediately (no leading rest). */
+    private void reanchorToCurrent() {
+        long baseMusic = (currentEventIndex < events.size())
+                ? events.get(currentEventIndex).timeMs : 0;
+        anchorMusicMs = baseMusic;
+        anchorWallMs = SystemClock.uptimeMillis();
+        lastProgressMs = 0;
     }
 
-    private void playNextBatch() {
-        if (!isPlaying || currentEventIndex >= events.size()) {
-            isPlaying = false;
-            if (stateCallback != null) stateCallback.onPlaybackStopped();
-            return;
+    /**
+     * Fire every event that is already due (target <= now) in a tight loop,
+     * then schedule the next pump at the exact absolute target time of the
+     * next pending event. Runs on the player HandlerThread.
+     */
+    private void pump() {
+        if (!isPlaying) return;
+        boostPriorityOnce();
+
+        final long now = SystemClock.uptimeMillis();
+        final float speed = speedMultiplier;
+
+        while (isPlaying && currentEventIndex < events.size()) {
+            NoteEvent e = events.get(currentEventIndex);
+            long target = anchorWallMs + (long) ((e.timeMs - anchorMusicMs) / speed);
+            if (target > now) {
+                // Next event is in the future — schedule pump precisely at its
+                // absolute target. Drift never accumulates because target is
+                // derived from the fixed anchor + the event's true music time.
+                handler.postAtTime(pumpRunnable, target);
+                maybeReportProgress();
+                return;
+            }
+            fire(e);
+            currentEventIndex++;
         }
 
-        NoteEvent current = events.get(currentEventIndex);
+        // End of file
+        finishPlayback();
+    }
 
-        // Fire current event (respect channel filter, always skip ch9 drums)
+    private void fire(NoteEvent e) {
+        if (noteCallback == null) return;
+        if (e.note < 21 || e.note > 107) return;
+        if (e.channel == 9) return; // skip percussion channel
         int filter = channelFilter;
-        if (noteCallback != null && current.note >= 21 && current.note <= 107) {
-            if (current.channel == 9) {
-                // Skip percussion channel — note numbers mean different instruments, not piano keys
-            } else if (filter == -1 || current.channel == filter) {
-                noteCallback.onNote(current.note, current.isDown, current.velocity);
-            }
+        if (filter == -1 || e.channel == filter) {
+            noteCallback.onNote(e.note, e.isDown, e.velocity);
         }
-        currentEventIndex++;
+    }
 
-        // Report progress
-        if (stateCallback != null) {
-            float pct = (float) currentEventIndex / events.size() * 100f;
-            stateCallback.onProgress(pct);
+    private void finishPlayback() {
+        isPlaying = false;
+        // Release all held notes
+        if (noteCallback != null) {
+            for (int n = 21; n <= 107; n++) noteCallback.onNote(n, false, 0);
         }
+        if (stateCallback != null) stateCallback.onPlaybackStopped();
+    }
 
-        // Schedule next event
-        if (currentEventIndex < events.size()) {
-            NoteEvent next = events.get(currentEventIndex);
-            long delayMs = tickDeltaToMs(current.absoluteTick, next.absoluteTick);
-            // Apply speed
-            delayMs = (long) (delayMs / speedMultiplier);
-            if (delayMs <= 0) {
-                // Simultaneous events — fire immediately
-                handler.post(this::playNextBatch);
-            } else {
-                handler.postDelayed(this::playNextBatch, delayMs);
-            }
-        } else {
-            // End of file
-            isPlaying = false;
-            if (stateCallback != null) stateCallback.onPlaybackStopped();
-        }
+    /** Report progress at most ~10 Hz to keep float work off the hot path. */
+    private void maybeReportProgress() {
+        if (stateCallback == null || events.isEmpty()) return;
+        long now = SystemClock.uptimeMillis();
+        if (now - lastProgressMs < 100) return;
+        lastProgressMs = now;
+        float pct = (float) currentEventIndex / events.size() * 100f;
+        stateCallback.onProgress(pct);
+    }
+
+    private void boostPriorityOnce() {
+        if (priorityBoosted) return;
+        priorityBoosted = true;
+        // Belt-and-suspenders: re-assert URGENT_AUDIO from inside the running
+        // thread in case the HandlerThread-constructor boost was rejected.
+        try {
+            android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
+        } catch (Throwable ignored) {}
     }
 
     /**
@@ -271,6 +357,21 @@ public class MidiFilePlayer {
         }
 
         return totalMicros / 1000; // µs -> ms
+    }
+
+    /**
+     * Precompute each event's absolute time (ms @1.0x) once after parsing.
+     * Events are already sorted by tick, so we accumulate per-interval deltas
+     * (tempo-aware) — giving a fixed, drift-free reference timeline for playback.
+     */
+    private void precomputeTimes() {
+        long prevTick = 0;
+        long accMs = 0;
+        for (NoteEvent e : events) {
+            accMs += tickDeltaToMs(prevTick, e.absoluteTick);
+            e.timeMs = accMs;
+            prevTick = e.absoluteTick;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -373,6 +474,9 @@ public class MidiFilePlayer {
         // Sort note events by absolute tick (merge all tracks)
         Collections.sort(allEvents, (a, b) -> Long.compare(a.absoluteTick, b.absoluteTick));
         events = allEvents;
+
+        // Precompute the drift-free playback timeline.
+        precomputeTimes();
     }
 
     private String readString(byte[] data, int len) {
