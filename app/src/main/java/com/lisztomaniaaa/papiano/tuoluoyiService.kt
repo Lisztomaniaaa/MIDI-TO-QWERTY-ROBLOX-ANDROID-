@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Background-only MIDI -> virtual keyboard bridge. No popup overlay, no UI.
  *
- * Mode is locked to QWERTY. Octave range covers the full 88-key span (21..107).
+ * Mode is locked to QWERTY. Octave range covers the full 88-key span (21..108 = A0..C8).
  * MIDI device name is broadcast to MainActivity via "intent.tuoluoyi.midi_device".
  *
  * STABILITY NOTES (POCO X3 Pro / MIUI 14 bug-report driven):
@@ -215,7 +215,7 @@ class tuoluoyiService : AccessibilityService() {
                         val note = intent.getIntExtra("note", -1)
                         val down = intent.getBooleanExtra("down", false)
                         val vel = intent.getIntExtra("vel", 0)
-                        if (note in 21..107) {
+                        if (note in 21..108) {
                             // velocity dikirim hanya saat toggle ON & note-on.
                             val v = if (velocityEnabled && down) vel else 0
                             try { iGamePad?.qwertyKey(note, down, v) }
@@ -741,7 +741,7 @@ class tuoluoyiService : AccessibilityService() {
                         (messageType == NOTE_ON && velocity == 0)
                 if (!isPress && !isRelease) { i += 3; continue }
 
-                if (noteNumber !in 21..107) { i += 3; continue }
+                if (noteNumber !in 21..108) { i += 3; continue }
 
                 val gp = iGamePad
                 if (gp == null) {

@@ -22,7 +22,7 @@ import java.util.List;
  * Features:
  * - Variable speed (0.25x - 2.0x)
  * - Play / Pause / Stop
- * - Auto-clamp to note range 21-107
+ * - Auto-clamp to note range 21-108 (full 88-key piano, A0..C8)
  * - Tempo map (handles mid-song tempo changes correctly)
  * - Channel filter (default: channel 0 only, configurable)
  *
@@ -220,7 +220,7 @@ public class MidiFilePlayer {
         handler.removeCallbacksAndMessages(null);
         // Release all held notes
         if (noteCallback != null) {
-            for (int n = 21; n <= 107; n++) {
+            for (int n = 21; n <= 108; n++) {
                 noteCallback.onNote(n, false, 0);
             }
         }
@@ -278,7 +278,7 @@ public class MidiFilePlayer {
 
     private void fire(NoteEvent e) {
         if (noteCallback == null) return;
-        if (e.note < 21 || e.note > 107) return;
+        if (e.note < 21 || e.note > 108) return;
         if (e.channel == 9) return; // skip percussion channel
         int filter = channelFilter;
         if (filter == -1 || e.channel == filter) {
@@ -290,7 +290,7 @@ public class MidiFilePlayer {
         isPlaying = false;
         // Release all held notes
         if (noteCallback != null) {
-            for (int n = 21; n <= 107; n++) noteCallback.onNote(n, false, 0);
+            for (int n = 21; n <= 108; n++) noteCallback.onNote(n, false, 0);
         }
         if (stateCallback != null) stateCallback.onPlaybackStopped();
     }

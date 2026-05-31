@@ -591,7 +591,7 @@ static const KeyEntry g_keyLookup[NUM_KEYS] = {
     {0x11, 0x00}, // "n"
     {0x10, 0x00}, // "m"
 
-    // C#7 to C8 (notes 96-107) — ctrl_ prefix = meta 0x01
+    // C#7 to C8 (notes 97-108) — ctrl_ prefix = meta 0x01
     {0x1C, 0x01}, // ctrl_y
     {0x18, 0x01}, // ctrl_u
     {0x0C, 0x01}, // ctrl_i
@@ -719,9 +719,12 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
                                                      jint noteNumber,
                                                      jboolean isDown,
                                                      jint velocity) {
-    if (!(noteNumber >= 21 && noteNumber <= 107)) {
+    if (!(noteNumber >= 21 && noteNumber <= 108)) {
         return; // silent drop — no log on hot path
     }
+    // Range is 21..108 inclusive = the full 88-key piano (A0..C8).
+    // g_keyLookup has NUM_KEYS(88) entries: index 0 = note 21 (A0),
+    // index 87 = note 108 (C8 -> ctrl_j). Capping at 107 used to drop C8.
 
     // Latency/jitter: daemon nanganin note event lewat binder oneway dari MIDI
     // dispatcher. Binder pakai thread POOL, jadi boost dilakukan PER-THREAD

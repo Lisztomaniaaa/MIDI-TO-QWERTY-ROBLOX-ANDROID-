@@ -364,7 +364,7 @@ class FloatingPanelService : Service() {
         if (midiFilePlayer == null) {
             midiFilePlayer = MidiFilePlayer()
             midiFilePlayer?.setNoteCallback { noteNumber, isDown, velocity ->
-                if (noteNumber < 21 || noteNumber > 107) return@setNoteCallback
+                if (noteNumber < 21 || noteNumber > 108) return@setNoteCallback
                 // FAST PATH: call the daemon binder directly (no broadcast hop).
                 // The old sendBroadcast route went through ActivityManager and
                 // added tens of ms latency + jitter per note. qwertyKey is
