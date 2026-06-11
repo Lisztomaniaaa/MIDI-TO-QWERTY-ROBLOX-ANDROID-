@@ -924,17 +924,35 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
         // Roblox sustain is absolute (hold=sound, release=stop) so
         // dropping doesn't cause audio gaps — notes just get re-triggered.
         //
-        // OPT: NO intermediate empty-report write here. The single
-        // emitHeldReport() at the end of the press path will write a
-        // report with just the new note — same effect (release-old +
-        // press-new collapsed into one report) but 1 fewer HID syscall.
-        // That's directly visible at the dispatcher: notes after a
-        // modifier transition fire ~20-100us sooner.
+        // HEX-COLLISION CASE (the subtle one):
+        //   Many natural+sharp pairs share the SAME HID keycode and only
+        //   differ by modifier — e.g. note 69 (A4 = "p") and note 70
+        //   (Bb4 = "P") both use 0x13. If user plays A→Bb with A still
+        //   held (legato), the next emitHeldReport would write a report
+        //   that only flips the modifier; key 0x13 stays down across
+        //   reports so the kernel emits NO KEY_P transition and Roblox's
+        //   InputBegan handler never fires for the new note → Bb is
+        //   silent even though shift went down. We MUST insert an
+        //   intermediate empty report so the shared key cycles up→down,
+        //   forcing Roblox to see a fresh InputBegan with the new
+        //   modifier state.
+        //
+        //   When there's NO hex collision (e.g. holding "q" then
+        //   pressing "!"), the single emitHeldReport at the end of the
+        //   press path already produces a clean release-old + press-new
+        //   transition in one report — no intermediate write needed.
         if (!g_heldKeys.empty()) {
             int currentMeta = 0;
-            for (const auto& h : g_heldKeys) currentMeta |= h.meta;
+            bool hexCollision = false;
+            for (const auto& h : g_heldKeys) {
+                currentMeta |= h.meta;
+                if (h.hex == key.hex) hexCollision = true;
+            }
             if (currentMeta != key.meta) {
                 g_heldKeys.clear();
+                if (hexCollision) {
+                    writeKeyboard(); // empty report — force the shared key to cycle
+                }
             }
         }
 
