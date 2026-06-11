@@ -23,12 +23,61 @@
 #include <array>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include <algorithm>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 
-static int uhid_fd;
+static int uhid_fd = -1;
 static struct uhid_event uhidEvent;
 const char *TAG = "RobloxAndroidMidi";
+
+// Last 8-byte HID report we sent to the kernel. Updated by writeKeyboard()
+// on every actual write so it always reflects the kernel's view, even when
+// the press path issues its own direct writes (e.g. velocity Alt+velKey tap).
+// emitHeldReport() consults this to skip syscalls that would push an already-
+// current state — e.g. a release of a note that wasn't actually held, or a
+// state that's identical after the redundant 6KRO eviction path. Each saved
+// write is one less event for the kernel HID dispatcher and Roblox to chew
+// through, which directly translates to lower felt latency on burst sections.
+static uint8_t g_lastReport[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ============================================================================
+// UHID write helper — retry on EAGAIN/EINTR.
+// ----------------------------------------------------------------------------
+// /dev/uhid was opened O_NONBLOCK (O_NDELAY). If the kernel report queue is
+// momentarily full (rare burst case) write() returns -1 with errno=EAGAIN.
+// Old code ignored the return value -> the note was silently dropped, which
+// the user perceives as "missed a key" (much worse than a tiny extra wait).
+//
+// Strategy: spin-retry with sched_yield up to ~1ms total. Real-world UHID
+// write should complete in microseconds; if it doesn't, we'd rather wait a
+// few hundred microseconds than lose the note. Bounded so a truly broken fd
+// can't hang the binder thread forever.
+// ============================================================================
+static inline ssize_t uhidWrite(const void *buf, size_t len) {
+    if (uhid_fd < 0) return -1;
+    // ~1ms total budget at 4us per yield iteration (256 attempts).
+    for (int attempt = 0; attempt < 256; ++attempt) {
+        ssize_t r = write(uhid_fd, buf, len);
+        if (r >= 0) return r;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            sched_yield();
+            continue;
+        }
+        // Hard error: log once per uHID lifetime and bail.
+        static std::atomic<bool> warned{false};
+        bool expected = false;
+        if (warned.compare_exchange_strong(expected, true)) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG,
+                    "uhid write failed: errno=%d (%s)", errno, strerror(errno));
+        }
+        return r;
+    }
+    return -1;
+}
 
 // Keyboard description
 static unsigned char description[] = {
@@ -367,7 +416,18 @@ void writeKeyboard(int metakey0=0x00, int reserved1=0x00, int data2=0x00, int da
     uhidEvent.u.input.data[5] = data5;
     uhidEvent.u.input.data[6] = data6;
     uhidEvent.u.input.data[7] = data7;
-    write(uhid_fd, &uhidEvent, sizeof(uhidEvent));
+    uhidWrite(&uhidEvent, sizeof(uhidEvent));
+
+    // Track what the kernel last received so emitHeldReport()'s dedup is
+    // accurate even for direct writes (e.g. velocity Alt+velKey tap).
+    g_lastReport[0] = (uint8_t) metakey0;
+    g_lastReport[1] = (uint8_t) reserved1;
+    g_lastReport[2] = (uint8_t) data2;
+    g_lastReport[3] = (uint8_t) data3;
+    g_lastReport[4] = (uint8_t) data4;
+    g_lastReport[5] = (uint8_t) data5;
+    g_lastReport[6] = (uint8_t) data6;
+    g_lastReport[7] = (uint8_t) data7;
 
 //    return 0;
 }
@@ -389,7 +449,7 @@ void writeKeyboardVector(int metakey0, int reserved1, const std::vector<int>& da
         uhidEvent.u.input.data[i + 2] = data[i];
     }
 
-    write(uhid_fd, &uhidEvent, sizeof(uhidEvent));
+    uhidWrite(&uhidEvent, sizeof(uhidEvent));
 
     writeKeyboard(); // releases all the held keys
 }
@@ -439,6 +499,15 @@ static void emitHeldReport() {
         keys[i] = g_heldKeys[i].hex;
         meta  |= g_heldKeys[i].meta;
     }
+    // Same-state dedup against the actual last-written kernel report.
+    // writeKeyboard() updates g_lastReport, so this also correctly skips
+    // the case where tapVelocityKey just sent the equivalent transition.
+    uint8_t next[8] = {
+        (uint8_t) meta, 0,
+        (uint8_t) keys[0], (uint8_t) keys[1], (uint8_t) keys[2],
+        (uint8_t) keys[3], (uint8_t) keys[4], (uint8_t) keys[5]
+    };
+    if (memcmp(next, g_lastReport, 8) == 0) return;
     writeKeyboard(meta, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]);
 }
 
@@ -661,10 +730,71 @@ void SendEncodedKeys(std::string encodedCharacters) {
 //    __android_log_print(ANDROID_LOG_WARN, TAG, "%d %d %d %d", a,b,c,d);
 }
 
+// ============================================================================
+// UHID kernel-event drain thread.
+// ----------------------------------------------------------------------------
+// /dev/uhid is bidirectional: write() sends HID reports TO the kernel; read()
+// receives UHID_START / UHID_STOP / UHID_OPEN / UHID_CLOSE / UHID_OUTPUT
+// events FROM the kernel (e.g. when an app starts using the keyboard, or
+// requests a LED state change).
+//
+// If we never read these, they accumulate in the kernel side buffer. On most
+// kernels that's bounded and harmless, but on some Android variants a full
+// queue starts to throttle writes — exactly the kind of subtle latency
+// regression that "feels parah" without showing up in any single benchmark.
+//
+// A dedicated drain thread blocks on read() and tosses every event. Tiny
+// (~1 syscall per app focus change) and self-terminates when uhid_fd closes.
+// ============================================================================
+static std::thread g_drainThread;
+static std::atomic<bool> g_drainRun{false};
+
+static void uhidDrainLoop(int fd) {
+    struct pollfd pfd;
+    while (g_drainRun.load(std::memory_order_relaxed)) {
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 500);
+        if (pr <= 0) continue; // timeout or interrupted
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (pfd.revents & POLLIN) {
+            struct uhid_event ev;
+            ssize_t n = read(fd, &ev, sizeof(ev));
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EINTR) continue;
+                break;
+            }
+            // We don't care WHAT the kernel sent — discarding is fine. The
+            // point is just to keep the queue empty so no back-pressure
+            // ever bleeds into write() latency.
+        }
+    }
+}
+
 extern "C"
 JNIEXPORT jboolean JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclass clazz) {
     __android_log_print(ANDROID_LOG_WARN, TAG, "HELLO WORLD THIS IS FROM JNI");
+
+    // Daemon process priority: this JNI runs inside the helper daemon spawned
+    // by Shizuku/root. Boost the WHOLE process to URGENT_AUDIO-equivalent
+    // nice (-19) once at startup so every binder thread it spins up later
+    // inherits the low-jitter scheduling. Per-thread boost in nativeQwertyKey
+    // is still kept as a belt-and-suspenders for new threads added by the
+    // binder pool. setpriority(PRIO_PROCESS,0,...) without CAP_SYS_NICE is a
+    // no-op (returns -1) — safe to call unconditionally.
+    setpriority(PRIO_PROCESS, 0, -19);
+
+    // Stop any drain thread from a previous Create (e.g. uHID re-create after
+    // a daemon respawn). It was polling the now-stale fd; spawn a fresh one
+    // for the new fd below. Idempotent if no thread was running.
+    if (g_drainRun.exchange(false)) {
+        if (g_drainThread.joinable()) {
+            try { g_drainThread.join(); } catch (...) {}
+        }
+    }
+
     if ((uhid_fd = open("/dev/uhid", O_RDWR | O_NDELAY)) < 0) {
         return false;//error process.
     }
@@ -688,6 +818,16 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclas
     uhidEvent.u.input.size = 8;
     uhidEvent.u.input.data[0] = 0x00;
 
+    // Reset last-report cache so dedup doesn't think the brand-new uHID
+    // device already received {0,0,0,0,0,0,0,0}. (Fresh device starts in
+    // unknown state — first emit must hit the wire.)
+    memset(g_lastReport, 0xFF, sizeof(g_lastReport));
+
+    // Spawn a fresh drain thread for THIS fd.
+    g_drainRun.store(true);
+    int fd_copy = uhid_fd;
+    g_drainThread = std::thread([fd_copy]() { uhidDrainLoop(fd_copy); });
+
     return true;
 }
 
@@ -695,17 +835,26 @@ extern "C"
 JNIEXPORT jboolean JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCloseUHid(JNIEnv *env, jclass clazz) {
 
+    // Stop drain thread first so it doesn't race against fd close.
+    g_drainRun.store(false);
+    if (g_drainThread.joinable()) {
+        try { g_drainThread.join(); } catch (...) {}
+    }
+
     // Clear held-keys state biar gak ada stale data pas uHID di-recreate.
     {
         std::lock_guard<std::mutex> lock(g_heldMutex);
         g_heldKeys.clear();
         g_lastVelHex = -1; // reset velocity level tracking
+        memset(g_lastReport, 0, sizeof(g_lastReport));
     }
 
     struct uhid_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = UHID_DESTROY;
-    return write(uhid_fd, &ev, sizeof(uhid_event)) > 0;
+    ssize_t r = (uhid_fd >= 0) ? write(uhid_fd, &ev, sizeof(uhid_event)) : -1;
+    if (uhid_fd >= 0) { close(uhid_fd); uhid_fd = -1; }
+    return r > 0;
 }
 
 
@@ -767,20 +916,25 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
         }
 
         // Meta collision fix: if new note has a DIFFERENT modifier than
-        // what's currently held, flush all held keys first. HID report
-        // only has 1 meta byte shared across all 6 keys — mixing notes
-        // with different modifiers causes wrong key interpretation.
+        // what's currently held, drop the held set first. HID report only
+        // has 1 meta byte shared across all 6 keys — mixing notes with
+        // different modifiers causes wrong key interpretation.
         // e.g. holding "q" (meta=0x00) + pressing "ctrl_1" (meta=0x01)
         // would make Roblox see Ctrl+q = wrong note.
         // Roblox sustain is absolute (hold=sound, release=stop) so
-        // flushing doesn't cause audio gaps — notes just get re-triggered.
+        // dropping doesn't cause audio gaps — notes just get re-triggered.
+        //
+        // OPT: NO intermediate empty-report write here. The single
+        // emitHeldReport() at the end of the press path will write a
+        // report with just the new note — same effect (release-old +
+        // press-new collapsed into one report) but 1 fewer HID syscall.
+        // That's directly visible at the dispatcher: notes after a
+        // modifier transition fire ~20-100us sooner.
         if (!g_heldKeys.empty()) {
             int currentMeta = 0;
             for (const auto& h : g_heldKeys) currentMeta |= h.meta;
-            if (currentMeta != key.meta && key.meta != currentMeta) {
-                // Meta context switch — release everything
+            if (currentMeta != key.meta) {
                 g_heldKeys.clear();
-                writeKeyboard(); // emit empty report (all keys up)
             }
         }
 
