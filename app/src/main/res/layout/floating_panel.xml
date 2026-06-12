@@ -13,14 +13,14 @@
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:paddingHorizontal="14dp"
-        android:paddingTop="10dp"
-        android:paddingBottom="6dp">
+        android:paddingTop="12dp"
+        android:paddingBottom="10dp">
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="papiano"
+            android:text="PAPIANO!"
             android:textColor="@color/accent_glow"
             android:textSize="14sp"
             android:textStyle="bold"
@@ -71,7 +71,7 @@
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#FF222222"
+                android:background="@color/brutal_black"
                 android:layout_marginBottom="8dp" />
 
             <!-- STATUS section -->
@@ -79,7 +79,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="STATUS"
-                android:textColor="#FF9CA3AF"
+                android:textColor="@color/brutal_black"
                 android:textSize="9sp"
                 android:letterSpacing="0.12" />
 
@@ -111,7 +111,7 @@
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#FF222222"
+                android:background="@color/brutal_black"
                 android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp" />
 
@@ -120,7 +120,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="MIDI INPUT"
-                android:textColor="#FF9CA3AF"
+                android:textColor="@color/brutal_black"
                 android:textSize="9sp"
                 android:letterSpacing="0.12" />
 
@@ -139,7 +139,7 @@
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#FF222222"
+                android:background="@color/brutal_black"
                 android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp" />
 
@@ -148,7 +148,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="MIDI FILE PLAYER"
-                android:textColor="#FF9CA3AF"
+                android:textColor="@color/brutal_black"
                 android:textSize="9sp"
                 android:letterSpacing="0.12" />
 
@@ -223,7 +223,7 @@
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:text="SPEED"
-                    android:textColor="#FF9CA3AF"
+                    android:textColor="@color/brutal_black"
                     android:textSize="9sp"
                     android:letterSpacing="0.12" />
 
@@ -250,7 +250,7 @@
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#FF222222"
+                android:background="@color/brutal_black"
                 android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp" />
 
@@ -272,7 +272,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:text="VELOCITY"
-                        android:textColor="#FF9CA3AF"
+                        android:textColor="@color/brutal_black"
                         android:textSize="9sp"
                         android:letterSpacing="0.12" />
 
@@ -298,7 +298,7 @@
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
-                android:background="#FF222222"
+                android:background="@color/brutal_black"
                 android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp" />
 
@@ -314,7 +314,7 @@
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:text="OPACITY"
-                    android:textColor="#FF9CA3AF"
+                    android:textColor="@color/brutal_black"
                     android:textSize="9sp"
                     android:letterSpacing="0.12" />
 
