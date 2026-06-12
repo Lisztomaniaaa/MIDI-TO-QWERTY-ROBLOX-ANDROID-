@@ -1,7 +1,6 @@
 package com.lisztomaniaaa.papiano;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.BroadcastReceiver;
@@ -27,7 +26,6 @@ import android.util.Log;
 import android.widget.Button;
 import android.widget.Switch;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import androidx.core.content.ContextCompat;
 
@@ -218,20 +216,21 @@ public class MainActivity extends Activity {
         t.printStackTrace(new java.io.PrintWriter(sw));
         final String trace = sw.toString();
         try {
-            new AlertDialog.Builder(this)
-                    .setTitle("Papiano crashed")
-                    .setMessage(trace)
-                    .setPositiveButton("Copy", (d, i) -> {
+            BrutalPopup.dialog(this,
+                    "Papiano crashed",
+                    trace,
+                    "Copy trace",
+                    () -> {
                         ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
                                 .setPrimaryClip(ClipData.newPlainText("crash", trace));
-                        Toast.makeText(this, "Stack trace copied", Toast.LENGTH_SHORT).show();
-                    })
-                    .setNegativeButton("Close", (d, i) -> finish())
-                    .setCancelable(false)
-                    .show();
+                        BrutalPopup.toast(this, "Stack trace copied", BrutalPopup.LENGTH_SHORT);
+                    },
+                    "Close", this::finish,
+                    null, null,
+                    false);
         } catch (Throwable t2) {
-            Toast.makeText(this, "Crash: " + t.getClass().getSimpleName()
-                    + " - " + t.getMessage(), Toast.LENGTH_LONG).show();
+            BrutalPopup.toast(this, "Crash: " + t.getClass().getSimpleName()
+                    + " - " + t.getMessage(), BrutalPopup.LENGTH_LONG);
         }
     }
 
@@ -245,8 +244,8 @@ public class MainActivity extends Activity {
 
         startBtn.setOnClickListener(v -> {
             if (!hasWriteSecureSettings()) {
-                Toast.makeText(this,
-                        "Activate the permission first.", Toast.LENGTH_SHORT).show();
+                BrutalPopup.toast(this,
+                        "Activate the permission first.", BrutalPopup.LENGTH_SHORT);
                 return;
             }
             if (!cachedAccessibilityEnabled && !canDrawOverlays()) {
@@ -270,15 +269,17 @@ public class MainActivity extends Activity {
         });
 
         Button closeBtn = findViewById(R.id.btn_force_close);
-        closeBtn.setOnClickListener(v -> new AlertDialog.Builder(this)
-                .setTitle(R.string.close_app_title)
-                .setMessage(R.string.close_app_text)
-                .setPositiveButton(R.string.close, (d, i) -> {
+        closeBtn.setOnClickListener(v -> BrutalPopup.dialog(this,
+                getString(R.string.close_app_title),
+                getString(R.string.close_app_text),
+                getString(R.string.close),
+                () -> {
                     sendBroadcast(new Intent("intent.tuoluoyi.exit"));
                     android.os.Process.killProcess(android.os.Process.myPid());
-                })
-                .setNegativeButton(R.string.cancel, null)
-                .show());
+                },
+                getString(R.string.cancel), null,
+                null, null,
+                true));
 
         // Velocity toggle ("Visual Piano" dynamics). Persist ke pref
         // "velocity_enabled" + broadcast ke tuoluoyiService biar update live
@@ -331,39 +332,42 @@ public class MainActivity extends Activity {
         java.io.File extDir = getExternalFilesDir(null);
         final String cmd = "sh " + (extDir != null ? extDir.getPath() : getFilesDir().getPath())
                 + "/starter.sh";
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.active_title)
-                .setMessage(R.string.active_text)
-                .setPositiveButton("Root", (d, i) -> {
+        BrutalPopup.dialog(this,
+                getString(R.string.active_title),
+                getString(R.string.active_text),
+                "Root",
+                () -> {
                     sp.edit().putString("activation_method", "root").apply();
                     bg.execute(() -> {
                         try {
                             Process p = Runtime.getRuntime().exec("su");
                             OutputStream o = p.getOutputStream();
                             o.write((cmd + "\nexit\n").getBytes()); o.flush(); o.close();
-                            ui.post(() -> Toast.makeText(this,
+                            ui.post(() -> BrutalPopup.toast(this,
                                     "Activation script sent to root shell.",
-                                    Toast.LENGTH_SHORT).show());
+                                    BrutalPopup.LENGTH_SHORT));
                         } catch (IOException ex) {
                             Log.e(TAG, "root", ex);
-                            ui.post(() -> Toast.makeText(this,
+                            ui.post(() -> BrutalPopup.toast(this,
                                     "Root not available.",
-                                    Toast.LENGTH_SHORT).show());
+                                    BrutalPopup.LENGTH_SHORT));
                         }
                     });
-                })
-                .setNeutralButton(R.string.copy_cmd, (d, i) -> {
+                },
+                "Shizuku",
+                () -> {
+                    sp.edit().putString("activation_method", "shizuku").apply();
+                    bg.execute(this::launchViaShizuku);
+                },
+                getString(R.string.copy_cmd),
+                () -> {
                     sp.edit().putString("activation_method", "adb").apply();
                     ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
                             .setPrimaryClip(ClipData.newPlainText("c", "adb shell " + cmd));
-                    Toast.makeText(this, "ADB command copied to clipboard.",
-                            Toast.LENGTH_LONG).show();
-                })
-                .setNegativeButton("Shizuku", (d, i) -> {
-                    sp.edit().putString("activation_method", "shizuku").apply();
-                    bg.execute(this::launchViaShizuku);
-                })
-                .show();
+                    BrutalPopup.toast(this, "ADB command copied to clipboard.",
+                            BrutalPopup.LENGTH_LONG);
+                },
+                true);
     }
 
     /* ---------------- SERVICE (accessibility) ---------------- */
@@ -433,10 +437,10 @@ public class MainActivity extends Activity {
                 }
             } catch (Exception e) {
                 Log.e(TAG, "toggleAccessibility", e);
-                ui.post(() -> Toast.makeText(this,
+                ui.post(() -> BrutalPopup.toast(this,
                         wantEnable ? "Failed to start the service."
                                    : "Failed to stop the service.",
-                        Toast.LENGTH_SHORT).show());
+                        BrutalPopup.LENGTH_SHORT));
             }
             refreshAccessibilityCacheAsync();
         });
@@ -450,12 +454,13 @@ public class MainActivity extends Activity {
     }
 
     private void showOverlayPermissionDialog() {
-        new AlertDialog.Builder(this)
-                .setTitle("Floating overlay permission")
-                .setMessage("Papiano butuh izin tampil di atas aplikasi lain "
+        BrutalPopup.dialog(this,
+                "Floating overlay permission",
+                "Papiano butuh izin tampil di atas aplikasi lain "
                         + "supaya panel kontrol tetap muncul saat kamu pindah "
-                        + "ke Roblox / app lain.")
-                .setPositiveButton("Open Settings", (d, i) -> {
+                        + "ke Roblox / app lain.",
+                "Open Settings",
+                () -> {
                     try {
                         Intent intent = new Intent(
                                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -464,13 +469,14 @@ public class MainActivity extends Activity {
                         startActivity(intent);
                     } catch (Throwable t) {
                         Log.w(TAG, "open overlay settings", t);
-                        Toast.makeText(this, "Buka Settings manual: "
+                        BrutalPopup.toast(this, "Buka Settings manual: "
                                 + "Apps -> Papiano -> Display over other apps",
-                                Toast.LENGTH_LONG).show();
+                                BrutalPopup.LENGTH_LONG);
                     }
-                })
-                .setNegativeButton(R.string.cancel, null)
-                .show();
+                },
+                getString(R.string.cancel), null,
+                null, null,
+                true);
     }
 
     private void startFloatingPanel() {
@@ -489,7 +495,7 @@ public class MainActivity extends Activity {
     /* ---------------- BROADCAST CALLBACKS ---------------- */
 
     private void onDaemonReady() {
-        Toast.makeText(this, R.string.connect_success, Toast.LENGTH_SHORT).show();
+        BrutalPopup.toast(this, R.string.connect_success, BrutalPopup.LENGTH_SHORT);
         refreshPermissionStatus();
         refreshAccessibilityCacheAsync();
     }
@@ -543,8 +549,8 @@ public class MainActivity extends Activity {
             ui.post(this::refreshPermissionStatus);
         } catch (Exception e) {
             Log.e(TAG, "shizuku", e);
-            ui.post(() -> Toast.makeText(this, "Shizuku is not running.",
-                    Toast.LENGTH_SHORT).show());
+            ui.post(() -> BrutalPopup.toast(this, "Shizuku is not running.",
+                    BrutalPopup.LENGTH_SHORT));
         }
     }
 
@@ -585,14 +591,14 @@ public class MainActivity extends Activity {
     }
 
     private void showWelcome() {
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.privacy_title)
-                .setMessage(R.string.privacy_text)
-                .setPositiveButton(R.string.agree,
-                        (d, i) -> sp.edit().putBoolean("first", false).apply())
-                .setNegativeButton(R.string.exit, (d, i) -> finish())
-                .setCancelable(false)
-                .show();
+        BrutalPopup.dialog(this,
+                getString(R.string.privacy_title),
+                getString(R.string.privacy_text),
+                getString(R.string.agree),
+                () -> sp.edit().putBoolean("first", false).apply(),
+                getString(R.string.exit), this::finish,
+                null, null,
+                false);
     }
 
     /* ---------------- ASSETS UNPACK (background only) ---------------- */
