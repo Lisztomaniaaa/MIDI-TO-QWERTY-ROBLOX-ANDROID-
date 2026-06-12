@@ -33,9 +33,9 @@
     <string name="midi_device_label">MIDI</string>
 
     <!-- Notifications -->
-    <string name="noti_text">Running</string>
-    <string name="noti_title">Papiano</string>
-    <string name="noti_action">Stop</string>
+    <string name="noti_text">MIDI bridge running • Tap to open</string>
+    <string name="noti_title">PAPIANO!</string>
+    <string name="noti_action">STOP</string>
     <string name="noti_channel">Service</string>
 
     <!-- Misc -->

@@ -35,7 +35,6 @@ import android.widget.RemoteViews
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
-import android.widget.Toast
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
@@ -183,7 +182,7 @@ class FloatingPanelService : Service() {
     private fun startForegroundCompat() {
         ensureChannel()
 
-        // Custom dark purple notification layout
+        // Custom neo-brutalist notification layout
         val customView = RemoteViews(packageName, R.layout.notification_floating)
 
         val builder = Notification.Builder(this, CHANNEL_ID)
@@ -191,6 +190,7 @@ class FloatingPanelService : Service() {
             .setOngoing(true)
             .setColor(getColor(R.color.accent_glow))
             .setCustomContentView(customView)
+            .setCustomBigContentView(customView)
             .setContentIntent(
                 PendingIntent.getActivity(this, 0,
                     Intent(this, MainActivity::class.java),
@@ -688,7 +688,7 @@ class FloatingPanelService : Service() {
                 "MIDI Connected"
             else
                 "MIDI Disconnected"
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            BrutalPopup.toast(this, msg, BrutalPopup.LENGTH_SHORT)
         } catch (t: Throwable) {
             Log.w(TAG, "midi toast", t)
         }

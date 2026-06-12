@@ -7,7 +7,6 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
-import android.widget.Toast;
 
 public class tileService extends TileService {
 

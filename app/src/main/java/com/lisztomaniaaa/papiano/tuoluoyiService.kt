@@ -25,7 +25,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
-import android.widget.Toast
+import android.widget.RemoteViews
 import androidx.core.content.ContextCompat
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -81,7 +81,7 @@ class tuoluoyiService : AccessibilityService() {
      * True saat kita lagi tunggu callback dari MidiManager.openDevice.
      * Tanpa flag ini, rescan periodik tiap 3s bisa nge-trigger openDevice
      * kedua kalinya kalau callback pertama lambat (USB MIDI di MIUI sering
-     * pelan), nyebabin port double-open + Toast spam Connected/Disconnected.
+     * pelan), nyebabin port double-open + popup spam Connected/Disconnected.
      */
     private var isOpeningMidi: Boolean = false
 
@@ -304,11 +304,11 @@ class tuoluoyiService : AccessibilityService() {
 
     /**
      * Show toast dari thread mana pun (kebanyakan call dari midiHandler thread).
-     * Toast wajib di main thread; kalau enggak, IllegalStateException.
+     * Popup wajib di main thread; kalau enggak, IllegalStateException.
      */
     private fun toastOnMain(msg: String) {
         mainHandler.post {
-            try { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+            try { BrutalPopup.toast(this, msg, BrutalPopup.LENGTH_LONG) }
             catch (t: Throwable) { Log.w(TAG, "toast", t) }
         }
     }
@@ -669,7 +669,7 @@ class tuoluoyiService : AccessibilityService() {
 
     private fun broadcastMidiDevice(name: String) {
         // De-dupe: kalau name-nya sama dgn yg terakhir kita kirim, skip.
-        // Tanpa ini Toast di FloatingPanelService bakal spam tiap rescan.
+        // Tanpa ini popup di FloatingPanelService bakal spam tiap rescan.
         if (name == lastBroadcastName) return
         lastBroadcastName = name
         try {
@@ -791,20 +791,25 @@ class tuoluoyiService : AccessibilityService() {
         // Pake vector kali (kecil) buat smallIcon. iconpop.png
         // 1536x1536 = ~9 MB Bitmap kalo di-decode -> rawan OOM di MIUI yg
         // memang lagi ketat memory.
+        val stopIntent = PendingIntent.getBroadcast(this, 0,
+            Intent("intent.tuoluoyi.exit").setPackage(packageName),
+            PendingIntent.FLAG_IMMUTABLE)
+        val openIntent = PendingIntent.getActivity(this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE)
+        val customView = RemoteViews(packageName, R.layout.notification_daemon).apply {
+            setOnClickPendingIntent(R.id.daemon_stop, stopIntent)
+        }
+
         val builder = Notification.Builder(this, channelId)
             .setContentTitle(getString(R.string.noti_title))
             .setContentText(getString(R.string.noti_text))
-            .addAction(Notification.Action(
-                android.R.drawable.ic_delete,
-                getString(R.string.noti_action),
-                PendingIntent.getBroadcast(this, 0,
-                    Intent("intent.tuoluoyi.exit").setPackage(packageName),
-                    PendingIntent.FLAG_IMMUTABLE)))
             .setSmallIcon(Icon.createWithResource(this, R.drawable.kali))
             .setColor(getColor(R.color.accent_primary))
-            .setContentIntent(PendingIntent.getActivity(this, 0,
-                Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_IMMUTABLE))
+            .setOngoing(true)
+            .setCustomContentView(customView)
+            .setCustomBigContentView(customView)
+            .setContentIntent(openIntent)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
