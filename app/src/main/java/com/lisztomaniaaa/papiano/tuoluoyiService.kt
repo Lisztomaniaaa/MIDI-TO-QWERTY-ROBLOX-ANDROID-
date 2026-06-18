@@ -76,6 +76,10 @@ class tuoluoyiService : AccessibilityService() {
      */
     private var currentMidiDeviceId: Int = -1
     private var lastBroadcastName: String = ""
+    @Volatile
+    private var selectedMidiId: Int = -1
+    @Volatile
+    private var selectedMidiName: String = "Auto (first available MIDI input)"
 
     /**
      * True saat kita lagi tunggu callback dari MidiManager.openDevice.
@@ -222,6 +226,21 @@ class tuoluoyiService : AccessibilityService() {
                             catch (_: Throwable) {}
                         }
                     }
+                    "intent.tuoluoyi.midi_select" -> {
+                        selectedMidiId = intent.getIntExtra("id", -1)
+                        selectedMidiName = intent.getStringExtra("name") ?: "Auto (first available MIDI input)"
+                        try { sp?.edit()?.putInt("midi_input_id", selectedMidiId)
+                            ?.putString("midi_input_name", selectedMidiName)?.apply() } catch (_: Throwable) {}
+                        midiHandler?.post {
+                            try {
+                                currentMidiDeviceId = -1
+                                try { midiOutputPort?.close() } catch (_: Throwable) {}
+                                midiOutputPort = null
+                                lastBroadcastName = "\u0000force-select"
+                                rescanMidi()
+                            } catch (e: Throwable) { Log.e(TAG, "midi_select rescan", e) }
+                        }
+                    }
                     "intent.tuoluoyi.set_velocity" -> {
                         // Toggle velocity dari UI (home / popup). Update field
                         // hot-path + persist biar konsisten lintas komponen.
@@ -346,6 +365,8 @@ class tuoluoyiService : AccessibilityService() {
         sp = getSharedPreferences("data", 0)
         // Restore velocity toggle state (default OFF).
         velocityEnabled = sp?.getBoolean("velocity_enabled", false) ?: false
+        selectedMidiId = sp?.getInt("midi_input_id", -1) ?: -1
+        selectedMidiName = sp?.getString("midi_input_name", "Auto (first available MIDI input)") ?: "Auto (first available MIDI input)"
         GamePadBridge.velocityEnabled = velocityEnabled
 
         // Start MIDI worker thread DULU sebelum apa pun yg mungkin nge-block.
@@ -363,6 +384,7 @@ class tuoluoyiService : AccessibilityService() {
                 addAction("intent.tuoluoyi.midi_request")
                 addAction("intent.tuoluoyi.midi_file_note")
                 addAction("intent.tuoluoyi.set_velocity")
+                addAction("intent.tuoluoyi.midi_select")
             }
             ContextCompat.registerReceiver(this, mBroadcastReceiver,
                 internalFilter,
@@ -375,10 +397,12 @@ class tuoluoyiService : AccessibilityService() {
         // bisa kill service).
         try { sendNotification() } catch (e: Throwable) { Log.e(TAG, "sendNotification", e) }
 
-        // autoGrant juga sentuh Settings.Secure (binder), pindah ke worker.
-        midiHandler?.post {
-            try { autoGrantAccessibilityIfNeeded() } catch (e: Throwable) {
-                Log.w(TAG, "autoGrant", e)
+        // Jangan auto-rewrite Settings.Secure kalau user sudah memilih stop/close.
+        if (sp?.getBoolean("service_desired_enabled", false) == true) {
+            midiHandler?.post {
+                try { autoGrantAccessibilityIfNeeded() } catch (e: Throwable) {
+                    Log.w(TAG, "autoGrant", e)
+                }
             }
         }
 
@@ -448,6 +472,10 @@ class tuoluoyiService : AccessibilityService() {
      * Jalan di background thread (Shizuku.newProcess + Process.waitFor blocking).
      */
     private fun respawnDaemon() {
+        if (sp?.getBoolean("service_desired_enabled", false) != true) {
+            Log.d(TAG, "respawnDaemon skipped: service not desired")
+            return
+        }
         Thread {
             val method = sp?.getString("activation_method", "shizuku") ?: "shizuku"
             val extDir = getExternalFilesDir(null)
@@ -609,7 +637,13 @@ class tuoluoyiService : AccessibilityService() {
         // Stabilkan pilihan device: kalau device current masih ada di list,
         // tetap pake itu (jangan flap ke device lain meskipun urutan
         // mm.devices berubah). Baru fallback ke first.
-        val target = outputCapable.firstOrNull { it.id == currentMidiDeviceId }
+        val target = when {
+            selectedMidiId >= 0 -> outputCapable.firstOrNull { it.id == selectedMidiId }
+            else -> null
+        } ?: outputCapable.firstOrNull { info ->
+            val name = info.properties.getString(MidiDeviceInfo.PROPERTY_NAME) ?: ""
+            selectedMidiId >= 0 && selectedMidiName.isNotEmpty() && name == selectedMidiName
+        } ?: outputCapable.firstOrNull { it.id == currentMidiDeviceId }
             ?: outputCapable.first()
 
         if (target.id == currentMidiDeviceId && midiOutputPort != null) {

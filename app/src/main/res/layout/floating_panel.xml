@@ -295,47 +295,7 @@
 
 
 
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:background="@color/brutal_black"
-                android:layout_marginTop="8dp"
-                android:layout_marginBottom="8dp" />
 
-            <!-- OPACITY -->
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="OPACITY"
-                    android:textColor="@color/brutal_black"
-                    android:textSize="9sp"
-                    android:letterSpacing="0.12" />
-
-                <TextView
-                    android:id="@+id/tv_opacity_value"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="80%"
-                    android:textColor="@color/accent_glow"
-                    android:textSize="10sp" />
-            </LinearLayout>
-
-            <SeekBar
-                android:id="@+id/sb_opacity"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:max="100"
-                android:progress="80"
-                android:progressTint="@color/accent_glow"
-                android:thumbTint="@color/accent_glow"
-                android:layout_marginTop="2dp" />
 
         </LinearLayout>
     </ScrollView>

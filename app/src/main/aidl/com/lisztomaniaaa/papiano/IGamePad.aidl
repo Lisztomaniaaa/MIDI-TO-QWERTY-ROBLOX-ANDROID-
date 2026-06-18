@@ -22,10 +22,12 @@ interface IGamePad {
 
 //    void syncPrefs(boolean invX,boolean invY,int sensityX,int sensityY);
 
-    // oneway: fire-and-forget async transaction. Caller (note hot-path) doesn't
-    // block waiting for the daemon round-trip -> lower per-note latency. Oneway
-    // calls to the same binder are delivered in order, so note on/off ordering
-    // is preserved. Dead-binder still throws at transact time (caught upstream).
-    oneway void qwertyKey(int key, boolean isDown, int velocity);
+    // Synchronous on purpose: bounded backpressure prevents Binder oneway queue
+    // buildup during very dense MIDI playback (e.g. Etude Op.10 No.4).
+    void qwertyKey(int key, boolean isDown, int velocity);
+
+    // Packed triples: note, down(1/0), velocity. Used by MIDI file playback
+    // to deliver same-tick chords/bursts in one Binder transaction.
+    void qwertyBatch(in int[] noteEvents);
     void pianoRoomsKey(in int[] noteIntArray);
 }

@@ -71,11 +71,6 @@ class FloatingPanelService : Service() {
     private var tvMidi: TextView? = null
     private var tvServiceDot: TextView? = null
     private var tvServiceStatus: TextView? = null
-    private var sbOpacity: SeekBar? = null
-    private var tvOpacityValue: TextView? = null
-
-
-
     // MIDI File Player
     private var midiFilePlayer: MidiFilePlayer? = null
     private var tvMidiFileName: TextView? = null
@@ -93,8 +88,6 @@ class FloatingPanelService : Service() {
         private const val NOTIF_ID = 2
 
         private const val PREFS = "data"
-        private const val KEY_OPACITY = "floating_opacity"
-
         private const val KEY_X = "floating_x"
         private const val KEY_Y = "floating_y"
         private const val KEY_BUBBLE_X = "floating_bubble_x"
@@ -109,7 +102,6 @@ class FloatingPanelService : Service() {
          */
         const val KEY_USER_DISMISSED = "panel_user_dismissed"
 
-        private const val DEFAULT_OPACITY = 80
         private const val POLL_MS = 2000L
         private const val DRAG_SLOP_DP = 5
 
@@ -317,7 +309,6 @@ class FloatingPanelService : Service() {
 
         bindPanelChildren(view)
         setupPanelHandlers(view, params)
-        applyOpacity(sp.getInt(KEY_OPACITY, DEFAULT_OPACITY))
         renderMidi(lastMidiName, lastMidiConnected)
         requestMidiSnapshot()
     }
@@ -326,9 +317,6 @@ class FloatingPanelService : Service() {
         tvMidi = view.findViewById(R.id.tv_midi)
         tvServiceDot = view.findViewById(R.id.tv_service_dot)
         tvServiceStatus = view.findViewById(R.id.tv_service_status)
-        sbOpacity = view.findViewById(R.id.sb_opacity)
-        tvOpacityValue = view.findViewById(R.id.tv_opacity_value)
-
         // MIDI File Player views
         tvMidiFileName = view.findViewById(R.id.tv_midi_file_name)
         btnMidiLoad = view.findViewById(R.id.btn_midi_load)
@@ -354,41 +342,62 @@ class FloatingPanelService : Service() {
             }
         }
 
-        val saved = sp.getInt(KEY_OPACITY, DEFAULT_OPACITY)
-        sbOpacity?.progress = saved
-        tvOpacityValue?.text = "$saved%"
-
-
-
         // Init MIDI player
         if (midiFilePlayer == null) {
             midiFilePlayer = MidiFilePlayer()
-            midiFilePlayer?.setNoteCallback { noteNumber, isDown, velocity ->
-                if (noteNumber < 21 || noteNumber > 108) return@setNoteCallback
-                // FAST PATH: call the daemon binder directly (no broadcast hop).
-                // The old sendBroadcast route went through ActivityManager and
-                // added tens of ms latency + jitter per note. qwertyKey is
-                // oneway so this returns immediately.
-                val gp = GamePadBridge.gamePad
-                if (gp != null) {
+            midiFilePlayer?.setNoteCallback(object : MidiFilePlayer.NoteCallback {
+                override fun onNote(noteNumber: Int, isDown: Boolean, velocity: Int) {
+                    if (noteNumber < 21 || noteNumber > 108) return
+                    val gp = GamePadBridge.gamePad
+                    if (gp != null) {
+                        try {
+                            val v = if (GamePadBridge.velocityEnabled && isDown) velocity else 0
+                            gp.qwertyKey(noteNumber, isDown, v)
+                            return
+                        } catch (_: Throwable) {
+                            // stale/dead binder mid-respawn — fall through to broadcast
+                        }
+                    }
                     try {
-                        val v = if (GamePadBridge.velocityEnabled && isDown) velocity else 0
-                        gp.qwertyKey(noteNumber, isDown, v)
-                        return@setNoteCallback
-                    } catch (_: Throwable) {
-                        // stale/dead binder mid-respawn — fall through to broadcast
+                        sendBroadcast(Intent("intent.tuoluoyi.midi_file_note")
+                            .setPackage(packageName)
+                            .putExtra("note", noteNumber)
+                            .putExtra("down", isDown)
+                            .putExtra("vel", velocity))
+                    } catch (_: Throwable) {}
+                }
+
+                override fun onNotes(packedNoteEvents: IntArray?) {
+                    val events = packedNoteEvents ?: return
+                    val gp = GamePadBridge.gamePad
+                    if (gp != null) {
+                        try {
+                            if (!GamePadBridge.velocityEnabled) {
+                                // Velocity OFF: send the same-tick chord/burst as-is in
+                                // one synchronous Binder transaction. This avoids the
+                                // per-note async Binder backlog that makes fast etudes lag.
+                                gp.qwertyBatch(events)
+                            } else {
+                                val gated = events.copyOf()
+                                var i = 0
+                                while (i + 2 < gated.size) {
+                                    if (gated[i + 1] == 0) gated[i + 2] = 0
+                                    i += 3
+                                }
+                                gp.qwertyBatch(gated)
+                            }
+                            return
+                        } catch (_: Throwable) {
+                            // Fallback below if daemon binder died mid-song.
+                        }
+                    }
+                    var i = 0
+                    while (i + 2 < events.size) {
+                        onNote(events[i], events[i + 1] != 0, events[i + 2])
+                        i += 3
                     }
                 }
-                // FALLBACK: bridge not ready (daemon connecting/respawning).
-                // tuoluoyiService receives this and applies gating + calls binder.
-                try {
-                    sendBroadcast(Intent("intent.tuoluoyi.midi_file_note")
-                        .setPackage(packageName)
-                        .putExtra("note", noteNumber)
-                        .putExtra("down", isDown)
-                        .putExtra("vel", velocity))
-                } catch (_: Throwable) {}
-            }
+            })
             midiFilePlayer?.setStateCallback(object : MidiFilePlayer.StateCallback {
                 override fun onPlaybackStarted() {
                     mainHandler.post { btnMidiPlay?.setImageResource(R.drawable.ic_pause) }
@@ -424,19 +433,6 @@ class FloatingPanelService : Service() {
             stopSelf()
         }
 
-        sbOpacity?.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                if (!fromUser) return
-                applyOpacity(p)
-                tvOpacityValue?.text = "$p%"
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {
-                sp.edit()
-                    .putInt(KEY_OPACITY, s?.progress ?: DEFAULT_OPACITY)
-                    .apply()
-            }
-        })
 
         // MIDI File Player handlers
         btnMidiLoad?.setOnClickListener { openMidiFilePicker() }
@@ -461,14 +457,6 @@ class FloatingPanelService : Service() {
 
     }
 
-    private fun applyOpacity(percent: Int) {
-        val clamped = percent.coerceIn(0, 100)
-        try {
-            panelView?.background?.alpha = (255 * clamped / 100).coerceIn(0, 255)
-        } catch (t: Throwable) {
-            Log.w(TAG, "applyOpacity", t)
-        }
-    }
 
     /* ---------------- BUBBLE ---------------- */
 
@@ -481,7 +469,6 @@ class FloatingPanelService : Service() {
         panelView = null
         panelParams = null
         tvMidi = null; tvServiceDot = null; tvServiceStatus = null
-        sbOpacity = null; tvOpacityValue = null
 
         if (bubbleView != null) return
 

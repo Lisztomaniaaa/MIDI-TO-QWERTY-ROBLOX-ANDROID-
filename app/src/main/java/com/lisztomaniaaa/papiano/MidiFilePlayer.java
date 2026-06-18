@@ -48,6 +48,12 @@ public class MidiFilePlayer {
 
     public interface NoteCallback {
         void onNote(int noteNumber, boolean isDown, int velocity);
+        default void onNotes(int[] packedNoteEvents) {
+            if (packedNoteEvents == null) return;
+            for (int i = 0; i + 2 < packedNoteEvents.length; i += 3) {
+                onNote(packedNoteEvents[i], packedNoteEvents[i + 1] != 0, packedNoteEvents[i + 2]);
+            }
+        }
     }
 
     public interface StateCallback {
@@ -268,12 +274,52 @@ public class MidiFilePlayer {
                 maybeReportProgress();
                 return;
             }
-            fire(e);
-            currentEventIndex++;
+            fireDueTimeGroup(e.timeMs);
         }
 
         // End of file
         finishPlayback();
+    }
+
+    /**
+     * Fire all events that share the same MIDI timestamp as one packed batch.
+     * Fast pieces (e.g. dense Etude Op.10 No.4 passages) often contain chords
+     * and near-simultaneous note-off/on groups at the same tick. Sending those
+     * as one callback lets the daemon use one Binder transaction instead of a
+     * transaction per note, which prevents Binder queue lag at high tempos.
+     */
+    private void fireDueTimeGroup(long timeMs) {
+        if (noteCallback == null) return;
+        int start = currentEventIndex;
+        int triples = 0;
+        while (currentEventIndex < events.size()
+                && events.get(currentEventIndex).timeMs == timeMs) {
+            NoteEvent ev = events.get(currentEventIndex);
+            if (ev.note >= 21 && ev.note <= 108
+                    && ev.channel != 9
+                    && (channelFilter == -1 || ev.channel == channelFilter)) {
+                triples++;
+            }
+            currentEventIndex++;
+        }
+        if (triples == 0) return;
+        int[] packed = new int[triples * 3];
+        int out = 0;
+        for (int i = start; i < currentEventIndex; i++) {
+            NoteEvent ev = events.get(i);
+            if (ev.note < 21 || ev.note > 108) continue;
+            if (ev.channel == 9) continue;
+            int filter = channelFilter;
+            if (filter != -1 && ev.channel != filter) continue;
+            packed[out++] = ev.note;
+            packed[out++] = ev.isDown ? 1 : 0;
+            packed[out++] = ev.velocity;
+        }
+        if (packed.length == 3) {
+            noteCallback.onNote(packed[0], packed[1] != 0, packed[2]);
+        } else {
+            noteCallback.onNotes(packed);
+        }
     }
 
     private void fire(NoteEvent e) {

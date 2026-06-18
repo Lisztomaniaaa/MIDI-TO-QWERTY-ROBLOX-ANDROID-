@@ -58,8 +58,10 @@ static uint8_t g_lastReport[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 // ============================================================================
 static inline ssize_t uhidWrite(const void *buf, size_t len) {
     if (uhid_fd < 0) return -1;
-    // ~1ms total budget at 4us per yield iteration (256 attempts).
-    for (int attempt = 0; attempt < 256; ++attempt) {
+    // Keep the retry budget tiny on the note hot-path. Long spin retries
+    // create audible backlog during fast passages; a later note is worse than
+    // a rare dropped report, so cap this at a short burst.
+    for (int attempt = 0; attempt < 32; ++attempt) {
         ssize_t r = write(uhid_fd, buf, len);
         if (r >= 0) return r;
         if (errno == EINTR) continue;
@@ -974,6 +976,29 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
             emitHeldReport();
         }
     }
+}
+
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyBatch(JNIEnv *env,
+                                                      jclass thiz,
+                                                      jintArray noteEvents) {
+    if (noteEvents == nullptr) return;
+    jsize length = env->GetArrayLength(noteEvents);
+    if (length < 3) return;
+    jint *items = env->GetIntArrayElements(noteEvents, nullptr);
+    if (items == nullptr) return;
+
+    // Packed triples: note, down(1/0), velocity. This keeps dense same-tick
+    // MIDI file chords/bursts in one Binder + JNI hop instead of dozens of
+    // per-note transactions. nativeQwertyKey still owns the exact HID state
+    // machine, collision handling, velocity taps, and 6KRO eviction.
+    for (jsize i = 0; i + 2 < length; i += 3) {
+        Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(
+                env, thiz, items[i], items[i + 1] != 0, items[i + 2]);
+    }
+    env->ReleaseIntArrayElements(noteEvents, items, JNI_ABORT);
 }
 
 extern "C"

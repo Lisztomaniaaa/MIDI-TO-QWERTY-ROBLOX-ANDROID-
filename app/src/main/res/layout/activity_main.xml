@@ -245,6 +245,42 @@
                 android:stateListAnimator="@null" />
         </LinearLayout>
 
+
+        <!-- ═══════════ MIDI INPUT CARD ═══════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/card_glass"
+            android:orientation="vertical"
+            android:padding="22dp"
+            android:layout_marginBottom="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="MIDI INPUT!"
+                android:textColor="@color/brutal_black"
+                android:textSize="10sp"
+                android:letterSpacing="0.15"
+                android:textStyle="bold"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Choose the USB/native MIDI device Papiano should claim. Auto uses the first available input."
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp"
+                android:lineSpacingExtra="3dp"
+                android:layout_marginBottom="12dp" />
+
+            <Spinner
+                android:id="@+id/sp_midi_input"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:background="@drawable/input_bg" />
+        </LinearLayout>
+
         <!-- ═══════════ VELOCITY CARD ═══════════ -->
         <LinearLayout
             android:layout_width="match_parent"

@@ -14,6 +14,8 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.net.Uri;
+import android.media.midi.MidiDeviceInfo;
+import android.media.midi.MidiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -25,6 +27,9 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.Switch;
+import android.widget.ArrayAdapter;
+import android.widget.AdapterView;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import androidx.core.content.ContextCompat;
@@ -73,6 +78,9 @@ public class MainActivity extends Activity {
     Button startBtn;
     TextView tvPermissionStatus;
     TextView tvServiceStatus;
+    Spinner midiInputSpinner;
+    private final List<MidiChoice> midiChoices = new ArrayList<>();
+    private volatile boolean bindingMidiSpinner = false;
 
     SharedPreferences sp;
 
@@ -239,6 +247,7 @@ public class MainActivity extends Activity {
         startBtn = findViewById(R.id.btn_start_playing);
         tvPermissionStatus = findViewById(R.id.tv_permission_status);
         tvServiceStatus = findViewById(R.id.tv_service_status);
+        midiInputSpinner = findViewById(R.id.sp_midi_input);
 
         activateBtn.setOnClickListener(v -> showActivationDialog());
 
@@ -255,6 +264,7 @@ public class MainActivity extends Activity {
             // wantStart = user lagi mau ON-in service. Capture sebelum toggle
             // karena toggleAccessibility async (refresh cache di bg thread).
             final boolean wantStart = !cachedAccessibilityEnabled;
+            sp.edit().putBoolean("service_desired_enabled", wantStart).apply();
             toggleAccessibility();
 
             if (wantStart && canDrawOverlays()) {
@@ -274,12 +284,16 @@ public class MainActivity extends Activity {
                 getString(R.string.close_app_text),
                 getString(R.string.close),
                 () -> {
-                    sendBroadcast(new Intent("intent.tuoluoyi.exit"));
-                    android.os.Process.killProcess(android.os.Process.myPid());
+                    sp.edit().putBoolean("service_desired_enabled", false).apply();
+                    sendBroadcast(new Intent("intent.tuoluoyi.exit").setPackage(getPackageName()));
+                    stopService(new Intent(this, FloatingPanelService.class));
+                    ui.postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()), 300);
                 },
                 getString(R.string.cancel), null,
                 null, null,
                 true));
+
+        setupMidiInputSpinner();
 
         // Velocity toggle ("Visual Piano" dynamics). Persist ke pref
         // "velocity_enabled" + broadcast ke tuoluoyiService biar update live
@@ -296,6 +310,76 @@ public class MainActivity extends Activity {
                 Log.w(TAG, "broadcast set_velocity", t);
             }
         });
+    }
+
+
+    private static class MidiChoice {
+        final int id;
+        final String name;
+        MidiChoice(int id, String name) { this.id = id; this.name = name; }
+        @Override public String toString() { return name; }
+    }
+
+    private void setupMidiInputSpinner() {
+        if (midiInputSpinner == null) return;
+        midiInputSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, android.view.View view,
+                                                 int position, long id) {
+                if (bindingMidiSpinner || position < 0 || position >= midiChoices.size()) return;
+                MidiChoice choice = midiChoices.get(position);
+                sp.edit()
+                        .putInt("midi_input_id", choice.id)
+                        .putString("midi_input_name", choice.name)
+                        .apply();
+                sendBroadcast(new Intent("intent.tuoluoyi.midi_select")
+                        .setPackage(getPackageName())
+                        .putExtra("id", choice.id)
+                        .putExtra("name", choice.name));
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        refreshMidiChoicesAsync();
+    }
+
+    private void refreshMidiChoicesAsync() {
+        bg.execute(() -> {
+            List<MidiChoice> choices = new ArrayList<>();
+            choices.add(new MidiChoice(-1, "Auto (first available MIDI input)"));
+            try {
+                MidiManager mm = (MidiManager) getSystemService(MIDI_SERVICE);
+                if (mm != null) {
+                    MidiDeviceInfo[] devices = mm.getDevices();
+                    if (devices != null) {
+                        for (MidiDeviceInfo info : devices) {
+                            if (info.getOutputPortCount() <= 0) continue;
+                            String name = info.getProperties().getString(MidiDeviceInfo.PROPERTY_NAME);
+                            if (name == null || name.trim().isEmpty()) name = "MIDI device " + info.getId();
+                            choices.add(new MidiChoice(info.getId(), name));
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "refreshMidiChoices", t);
+            }
+            ui.post(() -> applyMidiChoices(choices));
+        });
+    }
+
+    private void applyMidiChoices(List<MidiChoice> choices) {
+        midiChoices.clear();
+        midiChoices.addAll(choices);
+        bindingMidiSpinner = true;
+        ArrayAdapter<MidiChoice> adapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, midiChoices);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        midiInputSpinner.setAdapter(adapter);
+        int savedId = sp.getInt("midi_input_id", -1);
+        int selected = 0;
+        for (int i = 0; i < midiChoices.size(); i++) {
+            if (midiChoices.get(i).id == savedId) { selected = i; break; }
+        }
+        midiInputSpinner.setSelection(selected, false);
+        bindingMidiSpinner = false;
     }
 
     /* ---------------- PERMISSION ---------------- */
@@ -653,6 +737,7 @@ public class MainActivity extends Activity {
         super.onResume();
         refreshPermissionStatus();
         refreshAccessibilityCacheAsync();
+        refreshMidiChoicesAsync();
         // Kalau service udah running + overlay perm udah granted (mis. user
         // baru pulang dari Settings), auto-start panel biar gak perlu pencet
         // Start Playing 2x. TAPI hormati flag panel_user_dismissed: kalau

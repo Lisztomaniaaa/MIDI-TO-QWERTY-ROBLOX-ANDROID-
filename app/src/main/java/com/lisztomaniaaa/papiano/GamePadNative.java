@@ -164,6 +164,8 @@ public class GamePadNative {
 
     static native void nativeQwertyKey(int noteNumber, boolean isDown, int velocity);
 
+    static native void nativeQwertyBatch(int[] noteEvents);
+
     static native void nativePianoRoomsKey(int[] noteIntArray);
 
     private static void sendBinderToAppByStickyBroadcast() {
@@ -201,6 +203,11 @@ public class GamePadNative {
 //                    } else {
 //                        return "Failure";
 //                    }
+                }
+
+                @Override
+                public void qwertyBatch(int[] noteEvents) throws RemoteException {
+                    nativeQwertyBatch(noteEvents);
                 }
 
                 @Override

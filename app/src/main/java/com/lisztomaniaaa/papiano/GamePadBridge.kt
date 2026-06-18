@@ -10,8 +10,10 @@ package com.lisztomaniaaa.papiano
  * though both components run in the SAME process.
  *
  * By publishing the live binder proxy here, the file player can call
- * iGamePad.qwertyKey() DIRECTLY (no broadcast hop), cutting the felt delay to
- * near the binder transaction cost only.
+ * iGamePad.qwertyKey()/qwertyBatch() DIRECTLY (no broadcast hop), cutting
+ * the felt delay to near the binder transaction cost only. qwertyBatch is
+ * used for same-tick MIDI file bursts so dense passages do not pile up a
+ * per-note Binder backlog.
  *
  * tuoluoyiService OWNS the binder lifecycle: it sets [gamePad] when the daemon
  * connects and nulls it on binder death. Readers MUST null-check and fall back
