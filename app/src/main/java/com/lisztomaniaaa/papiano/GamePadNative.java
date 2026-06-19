@@ -181,7 +181,7 @@ public class GamePadNative {
                     // QWERTY mode supports proper hold/sustain:
                     //   isDown=true  -> add note to held set, emit aggregated HID report
                     //   isDown=false -> remove note from held set, emit updated report
-                    // Limit 6KRO (HID boot-protocol). Lihat native-lib.cpp utk detail.
+                    // NKRO bitmap backend removes the old 6-key HID ceiling.
                     //
                     // velocity: 0 = velocity OFF (QWERTY polos). >0 = Visual Piano
                     // velocity mode -> native akan tap Alt+<velKey> (skema 32-step)

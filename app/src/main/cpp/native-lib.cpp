@@ -33,15 +33,16 @@ static int uhid_fd = -1;
 static struct uhid_event uhidEvent;
 const char *TAG = "RobloxAndroidMidi";
 
-// Last 8-byte HID report we sent to the kernel. Updated by writeKeyboard()
+// Last NKRO HID report we sent to the kernel. Updated by writeKeyboardNkro()
 // on every actual write so it always reflects the kernel's view, even when
 // the press path issues its own direct writes (e.g. velocity Alt+velKey tap).
 // emitHeldReport() consults this to skip syscalls that would push an already-
-// current state — e.g. a release of a note that wasn't actually held, or a
-// state that's identical after the redundant 6KRO eviction path. Each saved
-// write is one less event for the kernel HID dispatcher and Roblox to chew
-// through, which directly translates to lower felt latency on burst sections.
-static uint8_t g_lastReport[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// current state. Each saved write is one less event for the kernel HID
+// dispatcher and Roblox to chew through, which directly translates to lower
+// felt latency on burst sections.
+static constexpr size_t NKRO_REPORT_SIZE = 15;
+static constexpr int NKRO_MAX_USAGE = 103;
+static uint8_t g_lastReport[NKRO_REPORT_SIZE] = {0xFF};
 
 // ============================================================================
 // UHID write helper — retry on EAGAIN/EINTR.
@@ -86,36 +87,37 @@ static unsigned char description[] = {
         0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
         0x09, 0x06,        // Usage (Keyboard)
         0xA1, 0x01,        // Collection (Application)
-        0x05, 0x07,        //   Usage Page (Kbrd/Keypad)
-        0x19, 0xE0,        //   Usage Minimum (0xE0)
-        0x29, 0xE7,        //   Usage Maximum (0xE7)
+        0x05, 0x07,        //   Usage Page (Keyboard/Keypad)
+
+        // 8 modifier bits (Ctrl/Shift/Alt/GUI). Keep these as normal
+        // modifier bits because Roblox piano mappings still use Ctrl/Shift
+        // for octave/symbol compatibility.
+        0x19, 0xE0,        //   Usage Minimum (LeftControl)
+        0x29, 0xE7,        //   Usage Maximum (Right GUI)
         0x15, 0x00,        //   Logical Minimum (0)
         0x25, 0x01,        //   Logical Maximum (1)
         0x75, 0x01,        //   Report Size (1)
         0x95, 0x08,        //   Report Count (8)
-        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x95, 0x01,        //   Report Count (1)
-        0x75, 0x08,        //   Report Size (8)
-        0x81, 0x03,        //   Input (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x95, 0x05,        //   Report Count (5)
-        0x75, 0x01,        //   Report Size (1)
-        0x05, 0x08,        //   Usage Page (LEDs)
-        0x19, 0x01,        //   Usage Minimum (Num Lock)
-        0x29, 0x05,        //   Usage Maximum (Kana)
-        0x91, 0x02,        //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
-        0x95, 0x01,        //   Report Count (1)
-        0x75, 0x03,        //   Report Size (3)
-        0x91, 0x03,        //   Output (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
-        0x95, 0x06,        //   Report Count (6)
-        0x75, 0x08,        //   Report Size (8)
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x25, 0x65,        //   Logical Maximum (101)
-        0x05, 0x07,        //   Usage Page (Kbrd/Keypad)
-        0x19, 0x00,        //   Usage Minimum (0x00)
-        0x29, 0x65,        //   Usage Maximum (0x65)
-        0x81, 0x00,        //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0xC0,              // End Collection
+        0x81, 0x02,        //   Input (Data,Var,Abs)
 
+        // Reserved byte for keyboard compatibility / byte alignment.
+        0x95, 0x01,        //   Report Count (1)
+        0x75, 0x08,        //   Report Size (8)
+        0x81, 0x03,        //   Input (Const,Var,Abs)
+
+        // NKRO bitmap for keyboard usages 0x00..0x67 (104 bits = 13 bytes).
+        // This replaces the old boot-keyboard 6-slot array and removes the
+        // fundamental 6-finger / 6KRO ceiling.
+        0x05, 0x07,        //   Usage Page (Keyboard/Keypad)
+        0x19, 0x00,        //   Usage Minimum (0)
+        0x29, 0x67,        //   Usage Maximum (103)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x01,        //   Logical Maximum (1)
+        0x75, 0x01,        //   Report Size (1)
+        0x95, 0x68,        //   Report Count (104)
+        0x81, 0x02,        //   Input (Data,Var,Abs)
+
+        0xC0               // End Collection
 };
 
 const int NUM_KEYS = 88;
@@ -402,57 +404,40 @@ std::unordered_map<std::string, std::string> character_map = {
         {"11", "+"},
 };
 
-// Function to write 8 integers to the file descriptor
-void writeKeyboard(int metakey0=0x00, int reserved1=0x00, int data2=0x00, int data3=0x00, int data4=0x00, int data5=0x00, int data6=0x00, int data7=0x00) {
+// Function to write an NKRO bitmap report to the uHID file descriptor
+static void writeKeyboardNkro(int metakey0, const std::vector<int>& keys) {
+    memset(&uhidEvent, 0, sizeof(uhidEvent));
+    uhidEvent.type = UHID_INPUT;
+    uhidEvent.u.input.size = NKRO_REPORT_SIZE;
+    uhidEvent.u.input.data[0] = (uint8_t) metakey0;
+    uhidEvent.u.input.data[1] = 0x00;
 
-    // https://d1.amobbs.com/bbs_upload782111/files_47/ourdev_692986N5FAHU.pdf
-    // https://www.usbzh.com/article/detail-326.html
+    for (int usage : keys) {
+        if (usage < 0 || usage > NKRO_MAX_USAGE) continue;
+        size_t byteIndex = 2 + (usage / 8);
+        uint8_t bit = static_cast<uint8_t>(1u << (usage % 8));
+        if (byteIndex < NKRO_REPORT_SIZE) {
+            uhidEvent.u.input.data[byteIndex] |= bit;
+        }
+    }
 
-    uhidEvent.u.input.data[0] = metakey0;
-    uhidEvent.u.input.data[1] = reserved1; // Reserved
-
-    // Keyboard keys in HEX
-    uhidEvent.u.input.data[2] = data2;
-    uhidEvent.u.input.data[3] = data3;
-    uhidEvent.u.input.data[4] = data4;
-    uhidEvent.u.input.data[5] = data5;
-    uhidEvent.u.input.data[6] = data6;
-    uhidEvent.u.input.data[7] = data7;
+    if (memcmp(uhidEvent.u.input.data, g_lastReport, NKRO_REPORT_SIZE) == 0) return;
     uhidWrite(&uhidEvent, sizeof(uhidEvent));
+    memcpy(g_lastReport, uhidEvent.u.input.data, NKRO_REPORT_SIZE);
+}
 
-    // Track what the kernel last received so emitHeldReport()'s dedup is
-    // accurate even for direct writes (e.g. velocity Alt+velKey tap).
-    g_lastReport[0] = (uint8_t) metakey0;
-    g_lastReport[1] = (uint8_t) reserved1;
-    g_lastReport[2] = (uint8_t) data2;
-    g_lastReport[3] = (uint8_t) data3;
-    g_lastReport[4] = (uint8_t) data4;
-    g_lastReport[5] = (uint8_t) data5;
-    g_lastReport[6] = (uint8_t) data6;
-    g_lastReport[7] = (uint8_t) data7;
-
-//    return 0;
+// Compatibility wrapper: legacy callers pass up to six usages, but the actual
+// report is NKRO bitmap. New sustain path can hold far more than six keys.
+void writeKeyboard(int metakey0=0x00, int reserved1=0x00, int data2=0x00, int data3=0x00, int data4=0x00, int data5=0x00, int data6=0x00, int data7=0x00) {
+    std::vector<int> keys;
+    int values[6] = {data2, data3, data4, data5, data6, data7};
+    keys.reserve(6);
+    for (int v : values) if (v > 0) keys.push_back(v);
+    writeKeyboardNkro(metakey0, keys);
 }
 
 void writeKeyboardVector(int metakey0, int reserved1, const std::vector<int>& data) {
-    if (data.size() > 6) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Error: Too many data arguments");
-        return;
-    }
-
-    // https://d1.amobbs.com/bbs_upload782111/files_47/ourdev_692986N5FAHU.pdf
-    // https://www.usbzh.com/article/detail-326.html
-
-    uhidEvent.u.input.data[0] = metakey0;
-    uhidEvent.u.input.data[1] = reserved1; // Reserved
-
-    // Keyboard keys in HEX
-    for (size_t i = 0; i < data.size(); i++) {
-        uhidEvent.u.input.data[i + 2] = data[i];
-    }
-
-    uhidWrite(&uhidEvent, sizeof(uhidEvent));
-
+    writeKeyboardNkro(metakey0, data);
     writeKeyboard(); // releases all the held keys
 }
 
@@ -465,20 +450,14 @@ void tapKeyboard(int metakey0=0x00, int reserved1=0x00, int data2=0x00, int data
 // ============================================================================
 // QWERTY hold/sustain state
 // ----------------------------------------------------------------------------
-// HID keyboard report cuma support 6 key concurrently (boot-protocol 6KRO).
-// Kita track semua note yang lagi di-hold di g_heldKeys, dan tiap kali ada
-// press/release kita re-emit aggregated HID report dengan up-to-6 keys di-set.
+// NKRO keyboard report stores held physical usages as a bitmap, so the old
+// boot-keyboard 6KRO / "6 fingers" ceiling is gone. Kita track semua note yang
+// lagi di-hold di g_heldKeys, dan tiap press/release re-emit aggregated bitmap.
 //
-// Limit kapasitas 6: kalau note ke-7 masuk, note PALING LAMA (oldest) di-evict
-// dari held set untuk bikin ruang. Ini karena note tertua kemungkinan besar
-// udah "selesai bunyi" secara persepsi (sustain udah decay). Hasilnya:
-// chord besar tetep kedenger lengkap — cuma note paling awal yang di-cut.
-//
-// meta byte di-OR dari semua held keys (Roblox piano pake shift utk note
-// hitam tertentu dan ctrl utk oktaf paling rendah/tinggi). Kalo user
-// kombinasiin note dgn meta beda (mis. capital + ctrl_) hasil meta jadi
-// gabungan — sayangnya HID cuma punya 1 byte modifier, ini limit fundamental.
-// Use case piano normal jarang nyentuh case ini.
+// Important HID limitation that still exists: modifier bits (Ctrl/Shift/Alt)
+// are global for the whole keyboard report. Kalau mapping game memakai key yang
+// sama dengan modifier berbeda, nativeQwertyKey masih harus protect collision
+// supaya Roblox tidak salah baca note lama sebagai shifted/ctrl note.
 // ============================================================================
 
 struct HeldKey {
@@ -489,28 +468,17 @@ struct HeldKey {
 
 static std::vector<HeldKey> g_heldKeys;
 static std::mutex g_heldMutex;
-static const size_t HID_MAX_KEYS = 6;
-
 // Emit aggregated HID report dari current held set.
 // Caller MUST hold g_heldMutex.
 static void emitHeldReport() {
     int meta = 0;
-    int keys[HID_MAX_KEYS] = {0, 0, 0, 0, 0, 0};
-    size_t n = std::min(g_heldKeys.size(), HID_MAX_KEYS);
-    for (size_t i = 0; i < n; i++) {
-        keys[i] = g_heldKeys[i].hex;
-        meta  |= g_heldKeys[i].meta;
+    std::vector<int> keys;
+    keys.reserve(g_heldKeys.size());
+    for (const auto& h : g_heldKeys) {
+        keys.push_back(h.hex);
+        meta |= h.meta;
     }
-    // Same-state dedup against the actual last-written kernel report.
-    // writeKeyboard() updates g_lastReport, so this also correctly skips
-    // the case where tapVelocityKey just sent the equivalent transition.
-    uint8_t next[8] = {
-        (uint8_t) meta, 0,
-        (uint8_t) keys[0], (uint8_t) keys[1], (uint8_t) keys[2],
-        (uint8_t) keys[3], (uint8_t) keys[4], (uint8_t) keys[5]
-    };
-    if (memcmp(next, g_lastReport, 8) == 0) return;
-    writeKeyboard(meta, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]);
+    writeKeyboardNkro(meta, keys);
 }
 
 
@@ -558,15 +526,14 @@ static inline int velocityToIndex(int velocity) {
 // Held note yg kebetulan pakai hex sama dgn velKey di-skip biar gak dobel.
 // Caller MUST hold g_heldMutex.
 static void tapVelocityKey(int velHex) {
-    int keys[HID_MAX_KEYS] = {0, 0, 0, 0, 0, 0};
-    size_t k = 0;
-    // sisakan 1 slot utk velKey (max 5 held note ikut)
-    for (size_t i = 0; i < g_heldKeys.size() && k < HID_MAX_KEYS - 1; i++) {
-        if (g_heldKeys[i].hex == velHex) continue; // hindari duplikat keycode
-        keys[k++] = g_heldKeys[i].hex;
+    std::vector<int> keys;
+    keys.reserve(g_heldKeys.size() + 1);
+    for (const auto& h : g_heldKeys) {
+        if (h.hex == velHex) continue; // no duplicate usage in bitmap report
+        keys.push_back(h.hex);
     }
-    keys[k++] = velHex;
-    writeKeyboard(MOD_LEFTALT, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]);
+    keys.push_back(velHex);
+    writeKeyboardNkro(MOD_LEFTALT, keys);
     // restore: Alt + velKey dilepas, not yg di-hold tetep down
     emitHeldReport();
 }
@@ -703,7 +670,7 @@ std::vector<std::string> splitString(const std::string& input) {
     return result;
 }
 
-// Function to write 8 integers to the file descriptor
+// Function to write an NKRO bitmap report to the uHID file descriptor
 void SendEncodedKeys(std::string encodedCharacters) {
     // encodedCharacters = *6629*6000
 
@@ -803,7 +770,7 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclas
     struct uhid_event ev;
     memset(&ev, 0, sizeof(uhid_event));
     ev.type = UHID_CREATE;
-    strcpy((char *) ev.u.create.name, "uHidKeyboard");
+    strcpy((char *) ev.u.create.name, "PapianoNkroKeyboard");
     ev.u.create.rd_data = description;
     ev.u.create.rd_size = sizeof(description);
     ev.u.create.bus = 0x03;
@@ -817,11 +784,11 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclas
 
     memset(&uhidEvent, 0, sizeof(uhid_event));
     uhidEvent.type = UHID_INPUT;
-    uhidEvent.u.input.size = 8;
+    uhidEvent.u.input.size = NKRO_REPORT_SIZE;
     uhidEvent.u.input.data[0] = 0x00;
 
     // Reset last-report cache so dedup doesn't think the brand-new uHID
-    // device already received {0,0,0,0,0,0,0,0}. (Fresh device starts in
+    // device already received an all-zero NKRO report. (Fresh device starts in
     // unknown state — first emit must hit the wire.)
     memset(g_lastReport, 0xFF, sizeof(g_lastReport));
 
@@ -919,7 +886,7 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
 
         // Meta collision fix: if new note has a DIFFERENT modifier than
         // what's currently held, drop the held set first. HID report only
-        // has 1 meta byte shared across all 6 keys — mixing notes with
+        // has 1 global modifier byte shared across the whole report — mixing notes with
         // different modifiers causes wrong key interpretation.
         // e.g. holding "q" (meta=0x00) + pressing "ctrl_1" (meta=0x01)
         // would make Roblox see Ctrl+q = wrong note.
@@ -958,10 +925,8 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
             }
         }
 
-        // 6KRO limit: evict oldest held note to make room for new one.
-        if (g_heldKeys.size() >= HID_MAX_KEYS) {
-            g_heldKeys.erase(g_heldKeys.begin());
-        }
+        // NKRO bitmap backend: no six-key eviction. Keep every held note whose
+        // usage fits the report bitmap.
 
         g_heldKeys.push_back({static_cast<int>(noteNumber), key.meta, key.hex});
         emitHeldReport();
@@ -993,7 +958,7 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyBatch(JNIEnv *env,
     // Packed triples: note, down(1/0), velocity. This keeps dense same-tick
     // MIDI file chords/bursts in one Binder + JNI hop instead of dozens of
     // per-note transactions. nativeQwertyKey still owns the exact HID state
-    // machine, collision handling, velocity taps, and 6KRO eviction.
+    // machine, modifier collision handling, velocity taps, and NKRO state.
     for (jsize i = 0; i + 2 < length; i += 3) {
         Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(
                 env, thiz, items[i], items[i + 1] != 0, items[i + 2]);
