@@ -1,14 +1,10 @@
 package com.lisztomaniaaa.papiano;
 
 import android.app.Activity;
-import android.content.BroadcastReceiver;
 import android.content.ComponentName;
-import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -38,7 +34,6 @@ import java.util.concurrent.Executors;
 public class PermissionGateActivity extends Activity {
 
     private static final String TAG = "PermGate";
-    private static final long BINDER_TIMEOUT_MS = 10_000; // max wait for daemon binder
 
     private TextView tvStatus, tvDetail;
     private ProgressBar progressBar;
@@ -54,17 +49,6 @@ public class PermissionGateActivity extends Activity {
     });
 
     private volatile boolean activating = false;
-    private volatile boolean binderArrived = false;
-    private boolean receiverRegistered = false;
-
-    private final BroadcastReceiver binderReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if ("intent.tuoluoyi.sendBinder".equals(intent.getAction())) {
-                binderArrived = true;
-            }
-        }
-    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -82,16 +66,6 @@ public class PermissionGateActivity extends Activity {
         btnActivate.setOnClickListener(v -> startActivation());
         btnContinue.setOnClickListener(v -> navigateHome());
 
-        // Listen for daemon binder broadcast
-        try {
-            IntentFilter f = new IntentFilter("intent.tuoluoyi.sendBinder");
-            ContextCompat.registerReceiver(this, binderReceiver, f,
-                    ContextCompat.RECEIVER_EXPORTED);
-            receiverRegistered = true;
-        } catch (Throwable t) {
-            Log.w(TAG, "registerReceiver", t);
-        }
-
         // Auto-check: if already fully activated, skip straight to Home
         bg.execute(() -> {
             if (isFullyActivated()) {
@@ -105,7 +79,6 @@ public class PermissionGateActivity extends Activity {
     private void startActivation() {
         if (activating) return;
         activating = true;
-        binderArrived = false;
 
         btnActivate.setEnabled(false);
         btnContinue.setVisibility(View.GONE);
@@ -147,6 +120,11 @@ public class PermissionGateActivity extends Activity {
     /**
      * Atomic activation — runs ALL steps sequentially on bg thread.
      * Posts status updates to UI. Stops at first failure.
+     *
+     * NOTE: Daemon spawn is FIRE-AND-FORGET. We do NOT wait for binder.
+     * The daemon connects asynchronously via sticky broadcast → tuoluoyiService
+     * handles it → GamePadBridge gets set. Home screen shows live status.
+     * Original app never blocked on daemon — neither should we.
      */
     private void runActivation(String method) {
         try {
@@ -185,36 +163,16 @@ public class PermissionGateActivity extends Activity {
                 return;
             }
 
-            // ── Step 4: Spawn daemon ──
-            postStatus("Starting daemon...", "Waiting for connection...");
+            // ── Step 4: Spawn daemon (fire-and-forget) ──
+            postStatus("Starting daemon...", "");
 
             spawnDaemon(method);
+            // Give it a moment to start, but DON'T wait for binder.
+            // tuoluoyiService will receive the binder via sticky broadcast
+            // asynchronously. Home screen monitors connection status.
+            Thread.sleep(1000);
 
-            // ── Step 5: Wait for binder (max BINDER_TIMEOUT_MS) ──
-            long deadline = System.currentTimeMillis() + BINDER_TIMEOUT_MS;
-            while (!binderArrived && System.currentTimeMillis() < deadline) {
-                // Also check GamePadBridge directly (might have been set by tuoluoyiService)
-                if (GamePadBridge.gamePad != null) {
-                    try {
-                        if (GamePadBridge.gamePad.asBinder().pingBinder()) {
-                            binderArrived = true;
-                            break;
-                        }
-                    } catch (Throwable ignored) {}
-                }
-                Thread.sleep(500);
-
-                long remaining = (deadline - System.currentTimeMillis()) / 1000;
-                postStatus("Starting daemon...", "Waiting... (" + remaining + "s)");
-            }
-
-            if (!binderArrived && GamePadBridge.gamePad == null) {
-                postFailed("Daemon did not respond.",
-                        "Timeout waiting for daemon binder. Try again.");
-                return;
-            }
-
-            // ── ALL STEPS PASSED ──
+            // ── ALL STEPS PASSED → go to Home ──
             postSuccess();
 
         } catch (InterruptedException e) {
@@ -355,14 +313,11 @@ public class PermissionGateActivity extends Activity {
         }
     }
 
-    /** Full activation = permission + accessibility + daemon binder alive */
+    /** Activation = permission + accessibility. Daemon is async. */
     private boolean isFullyActivated() {
         if (!hasWriteSecureSettings()) return false;
         if (!isAccessibilityEnabled()) return false;
-        IGamePad gp = GamePadBridge.gamePad;
-        if (gp == null) return false;
-        try { return gp.asBinder().pingBinder(); }
-        catch (Throwable t) { return false; }
+        return true;
     }
 
     // ═══════════ UI HELPERS ═══════════
@@ -420,9 +375,6 @@ public class PermissionGateActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (receiverRegistered) {
-            try { unregisterReceiver(binderReceiver); } catch (Throwable ignored) {}
-        }
         bg.shutdownNow();
     }
 
