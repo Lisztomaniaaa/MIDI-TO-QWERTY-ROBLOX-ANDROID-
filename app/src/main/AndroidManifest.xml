@@ -83,13 +83,6 @@
         <activity android:name=".serviceStart" android:excludeFromRecents="true" android:exported="true" />
         <activity android:name=".serviceStop" android:excludeFromRecents="true" android:exported="true" />
 
-        <!-- MIDI file picker (transparent) -->
-        <activity
-            android:name=".MidiPickerActivity"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:excludeFromRecents="true"
-            android:exported="false" />
-
         <!-- Quick settings tile -->
         <service
             android:name=".tileService"

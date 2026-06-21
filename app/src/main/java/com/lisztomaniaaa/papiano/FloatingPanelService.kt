@@ -76,16 +76,7 @@ class FloatingPanelService : Service() {
 
 
 
-    // MIDI File Player
-    private var midiFilePlayer: MidiFilePlayer? = null
-    private var tvMidiFileName: TextView? = null
-    private var btnMidiLoad: ImageView? = null
-    private var btnMidiPlay: ImageView? = null
-    private var btnMidiStop: ImageView? = null
-    private var sbSpeed: SeekBar? = null
-    private var tvSpeedValue: TextView? = null
     private var swVelocity: Switch? = null
-    private var filePickerPending = false
 
     companion object {
         const val TAG = "PapianoFloating"
@@ -112,11 +103,6 @@ class FloatingPanelService : Service() {
         private const val DEFAULT_OPACITY = 80
         private const val POLL_MS = 2000L
         private const val DRAG_SLOP_DP = 5
-
-        /** Pending MIDI file URI from file picker (set by MidiPickerActivity) */
-        @Volatile
-        @JvmStatic
-        var pendingMidiUri: Uri? = null
     }
 
     private var lastMidiName: String = ""
@@ -138,13 +124,6 @@ class FloatingPanelService : Service() {
                     "intent.tuoluoyi.exit" -> {
                         // panel close button OR daemon stop -> tear down
                         stopSelf()
-                    }
-                    "intent.tuoluoyi.midi_file_picked" -> {
-                        val uri = pendingMidiUri
-                        if (uri != null) {
-                            pendingMidiUri = null
-                            loadMidiFromUri(uri)
-                        }
                     }
                 }
             } catch (t: Throwable) {
@@ -240,7 +219,6 @@ class FloatingPanelService : Service() {
         val f = IntentFilter().apply {
             addAction("intent.tuoluoyi.midi_device")
             addAction("intent.tuoluoyi.exit")
-            addAction("intent.tuoluoyi.midi_file_picked")
         }
         try {
             ContextCompat.registerReceiver(
@@ -329,19 +307,9 @@ class FloatingPanelService : Service() {
         sbOpacity = view.findViewById(R.id.sb_opacity)
         tvOpacityValue = view.findViewById(R.id.tv_opacity_value)
 
-        // MIDI File Player views
-        tvMidiFileName = view.findViewById(R.id.tv_midi_file_name)
-        btnMidiLoad = view.findViewById(R.id.btn_midi_load)
-        btnMidiPlay = view.findViewById(R.id.btn_midi_play)
-        btnMidiStop = view.findViewById(R.id.btn_midi_stop)
-        sbSpeed = view.findViewById(R.id.sb_speed)
-        tvSpeedValue = view.findViewById(R.id.tv_speed_value)
+        // Velocity toggle
         swVelocity = view.findViewById(R.id.sw_velocity)
-
-        // Velocity toggle ("Visual Piano" dynamics). State shared dgn home
-        // screen via pref "velocity_enabled". Broadcast ke tuoluoyiService
-        // biar update live.
-        swVelocity?.setOnCheckedChangeListener(null) // clear before set (re-inflate safe)
+        swVelocity?.setOnCheckedChangeListener(null)
         swVelocity?.isChecked = sp.getBoolean("velocity_enabled", false)
         swVelocity?.setOnCheckedChangeListener { _, checked ->
             sp.edit().putBoolean("velocity_enabled", checked).apply()
@@ -352,57 +320,6 @@ class FloatingPanelService : Service() {
             } catch (t: Throwable) {
                 Log.w(TAG, "broadcast set_velocity", t)
             }
-        }
-
-        val saved = sp.getInt(KEY_OPACITY, DEFAULT_OPACITY)
-        sbOpacity?.progress = saved
-        tvOpacityValue?.text = "$saved%"
-
-
-
-        // Init MIDI player
-        if (midiFilePlayer == null) {
-            midiFilePlayer = MidiFilePlayer()
-            midiFilePlayer?.setNoteCallback { noteNumber, isDown, velocity ->
-                if (noteNumber < 21 || noteNumber > 108) return@setNoteCallback
-                // FAST PATH: call the daemon binder directly (no broadcast hop).
-                // The old sendBroadcast route went through ActivityManager and
-                // added tens of ms latency + jitter per note. qwertyKey is
-                // oneway so this returns immediately.
-                val gp = GamePadBridge.gamePad
-                if (gp != null) {
-                    try {
-                        val v = if (GamePadBridge.velocityEnabled && isDown) velocity else 0
-                        gp.qwertyKey(noteNumber, isDown, v)
-                        return@setNoteCallback
-                    } catch (_: Throwable) {
-                        // stale/dead binder mid-respawn — fall through to broadcast
-                    }
-                }
-                // FALLBACK: bridge not ready (daemon connecting/respawning).
-                // tuoluoyiService receives this and applies gating + calls binder.
-                try {
-                    sendBroadcast(Intent("intent.tuoluoyi.midi_file_note")
-                        .setPackage(packageName)
-                        .putExtra("note", noteNumber)
-                        .putExtra("down", isDown)
-                        .putExtra("vel", velocity))
-                } catch (_: Throwable) {}
-            }
-            midiFilePlayer?.setStateCallback(object : MidiFilePlayer.StateCallback {
-                override fun onPlaybackStarted() {
-                    mainHandler.post { btnMidiPlay?.setImageResource(R.drawable.ic_pause) }
-                }
-                override fun onPlaybackStopped() {
-                    mainHandler.post { btnMidiPlay?.setImageResource(R.drawable.ic_play) }
-                }
-                override fun onProgress(percent: Float) {}
-            })
-        }
-        // Restore file name if already loaded
-        if (midiFilePlayer?.isLoaded == true) {
-            tvMidiFileName?.text = midiFilePlayer?.fileName ?: "No file loaded"
-            tvMidiFileName?.setTextColor(ContextCompat.getColor(this, R.color.accent_glow))
         }
     }
 
@@ -431,26 +348,6 @@ class FloatingPanelService : Service() {
                     .putInt(KEY_OPACITY, s?.progress ?: DEFAULT_OPACITY)
                     .apply()
             }
-        })
-
-        // MIDI File Player handlers
-        btnMidiLoad?.setOnClickListener { openMidiFilePicker() }
-        btnMidiPlay?.setOnClickListener {
-            val player = midiFilePlayer ?: return@setOnClickListener
-            if (player.isPlaying) player.pause()
-            else player.play()
-        }
-        btnMidiStop?.setOnClickListener { midiFilePlayer?.stop() }
-
-        sbSpeed?.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                if (!fromUser) return
-                val speed = p / 100f
-                midiFilePlayer?.setSpeed(speed)
-                tvSpeedValue?.text = "${String.format("%.1f", speed)}x"
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
         })
 
 
@@ -689,46 +586,6 @@ class FloatingPanelService : Service() {
         }
     }
 
-    /* ---------------- MIDI FILE PICKER ---------------- */
-
-    private fun openMidiFilePicker() {
-        try {
-            val intent = Intent(this, MidiPickerActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(intent)
-        } catch (t: Throwable) {
-            Log.e(TAG, "openMidiFilePicker", t)
-            try { /* toast removed */ }
-            catch (_: Throwable) {}
-        }
-    }
-
-    /** Called when MidiPickerActivity returns with a file URI */
-    fun loadMidiFromUri(uri: Uri) {
-        try {
-            val inputStream = contentResolver.openInputStream(uri) ?: return
-            val fileName = uri.lastPathSegment?.substringAfterLast('/') ?: "midi_file.mid"
-            val success = midiFilePlayer?.load(inputStream, fileName) ?: false
-            mainHandler.post {
-                if (success) {
-                    tvMidiFileName?.text = midiFilePlayer?.fileName ?: fileName
-                    tvMidiFileName?.setTextColor(ContextCompat.getColor(this, R.color.accent_glow))
-                } else {
-                    tvMidiFileName?.text = "Failed to load"
-                    tvMidiFileName?.setTextColor(ContextCompat.getColor(this, R.color.red))
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "loadMidiFromUri", t)
-            mainHandler.post {
-                tvMidiFileName?.text = "Error loading"
-                tvMidiFileName?.setTextColor(ContextCompat.getColor(this, R.color.red))
-            }
-        }
-    }
-
-
-
     /* ---------------- NUCLEAR TEARDOWN (Force Close) ---------------- */
 
     /**
@@ -737,10 +594,7 @@ class FloatingPanelService : Service() {
      */
     private fun performNuclearTeardown() {
         Thread {
-            // 1. Stop MIDI file player
-            try { midiFilePlayer?.stop() } catch (_: Throwable) {}
-
-            // 2. Disable accessibility service
+            // 1. Disable accessibility service
             try {
                 val svcName = android.content.ComponentName(packageName,
                     tuoluoyiService::class.java.name).flattenToString()
@@ -797,8 +651,6 @@ class FloatingPanelService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         mainHandler.removeCallbacksAndMessages(null)
-        try { midiFilePlayer?.destroy() } catch (_: Throwable) {}
-        midiFilePlayer = null
         try { pollThread?.quitSafely() } catch (_: Throwable) {}
         pollThread = null
         pollHandler = null
