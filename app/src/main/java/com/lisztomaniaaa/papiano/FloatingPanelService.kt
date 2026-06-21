@@ -113,7 +113,12 @@ class FloatingPanelService : Service() {
                         onMidiUpdate(name, connected)
                     }
                     "intent.tuoluoyi.exit" -> {
-                        // panel close button OR daemon stop -> tear down
+                        stopSelf()
+                    }
+                    "intent.papiano.force_remove_overlay" -> {
+                        // Nuclear teardown: remove views IMMEDIATELY so overlay
+                        // disappears even before process dies.
+                        removeAllOverlayViews()
                         stopSelf()
                     }
                 }
@@ -210,6 +215,7 @@ class FloatingPanelService : Service() {
         val f = IntentFilter().apply {
             addAction("intent.tuoluoyi.midi_device")
             addAction("intent.tuoluoyi.exit")
+            addAction("intent.papiano.force_remove_overlay")
         }
         try {
             ContextCompat.registerReceiver(
@@ -553,12 +559,40 @@ class FloatingPanelService : Service() {
     /* ---------------- NUCLEAR TEARDOWN (Force Close) ---------------- */
 
     /**
-     * Kill everything: daemon, accessibility, session. Full reset.
-     * After this, user must re-authenticate on next app launch.
+     * Remove all overlay views from WindowManager IMMEDIATELY.
+     * Must be called on main thread. After this, user sees no overlay.
+     */
+    private fun removeAllOverlayViews() {
+        panelView?.let {
+            try { wm.removeView(it) } catch (_: Throwable) {}
+        }
+        panelView = null
+        panelParams = null
+
+        bubbleView?.let {
+            try { wm.removeView(it) } catch (_: Throwable) {}
+        }
+        bubbleView = null
+        bubbleParams = null
+    }
+
+    /**
+     * Kill everything: remove overlays, disable accessibility, kill daemon,
+     * clear session, kill process. Called from floating panel ✕ button.
+     *
+     * SYNC ORDER:
+     *   1. Remove overlay views FIRST (user sees immediate feedback)
+     *   2. Disable accessibility
+     *   3. Kill daemon
+     *   4. Clear session
+     *   5. Delay → kill process
      */
     private fun performNuclearTeardown() {
+        // Step 1: Remove overlays IMMEDIATELY on main thread
+        removeAllOverlayViews()
+
         Thread {
-            // 1. Disable accessibility service
+            // Step 2: Disable accessibility service
             try {
                 val svcName = android.content.ComponentName(packageName,
                     tuoluoyiService::class.java.name).flattenToString()
@@ -574,12 +608,12 @@ class FloatingPanelService : Service() {
                 }
             } catch (_: Throwable) {}
 
-            // 3. Kill daemon
+            // Step 3: Kill daemon
             try { GamePadBridge.gamePad?.closeAndExit() } catch (_: Throwable) {}
             try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
             GamePadBridge.gamePad = null
 
-            // 4. Clear session
+            // Step 4: Clear session
             try {
                 sp.edit()
                     .putBoolean("session_active", false)
@@ -587,11 +621,11 @@ class FloatingPanelService : Service() {
                     .apply()
             } catch (_: Throwable) {}
 
-            // 5. Stop self + kill process
+            // Step 5: Stop self + delay + kill process
             mainHandler.postDelayed({
                 stopSelf()
                 android.os.Process.killProcess(android.os.Process.myPid())
-            }, 200)
+            }, 500)
         }.start()
     }
 

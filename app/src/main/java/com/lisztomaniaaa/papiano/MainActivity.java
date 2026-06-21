@@ -178,42 +178,45 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
     // ═══════════ HEALTH MONITOR CALLBACK ═══════════
 
     @Override
-    public void onHealthChanged(PermissionHealthMonitor.HealthState state) {
-        updateConnectionCard(state);
-        updateMidiDeviceList(state.midiDevices);
-        updateStartButton(state);
+    public void onHealthChanged(PermissionHealthMonitor.Status status, String message,
+                                List<PermissionHealthMonitor.MidiDeviceEntry> devices) {
+        updateConnectionCard(status, message);
+        updateMidiDeviceList(devices);
+        updateStartButton(status);
 
-        // If health drops while on Home → show blocking modal
-        if (!state.isHealthy() && isServiceRunning) {
+        // If health drops while playing → show soft warning (NOT blocking modal)
+        if (status == PermissionHealthMonitor.Status.UNHEALTHY && isServiceRunning) {
             isServiceRunning = false;
-            showHealthLostDialog(state);
+            BrutalPopup.toast(this, message, BrutalPopup.LENGTH_LONG);
         }
     }
 
-    private void updateConnectionCard(PermissionHealthMonitor.HealthState state) {
-        if (state.isHealthy()) {
+    private void updateConnectionCard(PermissionHealthMonitor.Status status, String message) {
+        if (status == PermissionHealthMonitor.Status.HEALTHY) {
             statusDot.setBackgroundTintList(ColorStateList.valueOf(
                     ContextCompat.getColor(this, R.color.green)));
             tvConnectionStatus.setText("Active");
             tvConnectionStatus.setTextColor(ContextCompat.getColor(this, R.color.green));
-            tvConnectionMethod.setText("via " + capitalize(state.activationMethod));
+            String method = sp.getString("activation_method", "shizuku");
+            tvConnectionMethod.setText("via " + capitalize(method));
+        } else if (status == PermissionHealthMonitor.Status.RECOVERING) {
+            statusDot.setBackgroundTintList(ColorStateList.valueOf(
+                    ContextCompat.getColor(this, R.color.accent_gold)));
+            tvConnectionStatus.setText("Recovering...");
+            tvConnectionStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_gold));
+            tvConnectionMethod.setText(message);
         } else {
             statusDot.setBackgroundTintList(ColorStateList.valueOf(
                     ContextCompat.getColor(this, R.color.red)));
-            tvConnectionStatus.setText("Unhealthy");
+            tvConnectionStatus.setText("Disconnected");
             tvConnectionStatus.setTextColor(ContextCompat.getColor(this, R.color.red));
-
-            List<String> issues = new ArrayList<>();
-            if (!state.hasPermission) issues.add("permission");
-            if (!state.hasAccessibility) issues.add("accessibility");
-            if (!state.hasDaemon) issues.add("daemon");
-            tvConnectionMethod.setText("Missing: " + TextUtils.join(", ", issues));
+            tvConnectionMethod.setText(message);
         }
     }
 
-    private void updateStartButton(PermissionHealthMonitor.HealthState state) {
-        if (!state.isHealthy()) {
-            btnStart.setText("Reconnect Required");
+    private void updateStartButton(PermissionHealthMonitor.Status status) {
+        if (status != PermissionHealthMonitor.Status.HEALTHY) {
+            btnStart.setText("Waiting for connection...");
             btnStart.setBackgroundTintList(ColorStateList.valueOf(
                     ContextCompat.getColor(this, R.color.text_muted)));
             btnStart.setEnabled(false);
@@ -270,7 +273,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
 
             swToggle.setChecked(device.enabled);
             swToggle.setOnCheckedChangeListener((btn, checked) -> {
-                healthMonitor.toggleDevice(device.id, checked);
+                device.enabled = checked;
                 // TODO: notify tuoluoyiService of device enable/disable
             });
 
@@ -332,27 +335,28 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
     /**
      * Nuclear teardown: kill EVERYTHING, clear session, exit to Login.
      *
-     * Order:
-     *   1. Stop MIDI file player (via FloatingPanel)
-     *   2. Stop FloatingPanelService
-     *   3. Disable AccessibilityService
-     *   4. Kill daemon (closeAndExit via binder)
-     *   5. Clear session + all active flags
-     *   6. Kill own process
+     * SYNC ORDER (critical — overlay must be removed BEFORE process dies):
+     *   1. Tell FloatingPanelService to remove overlay views immediately
+     *   2. Disable AccessibilityService
+     *   3. Kill daemon (closeAndExit via binder)
+     *   4. Clear session + all active flags
+     *   5. Stop FloatingPanelService
+     *   6. Delay 500ms (let service onDestroy run) → kill process
      */
     private void performNuclearTeardown() {
+        // Step 1: Remove overlay views IMMEDIATELY on main thread.
+        // This ensures the floating panel disappears even if the service
+        // hasn't processed stopService yet.
+        try {
+            sendBroadcast(new Intent("intent.papiano.force_remove_overlay")
+                    .setPackage(getPackageName()));
+        } catch (Throwable ignored) {}
+
         bg.execute(() -> {
-            // 1-2. Stop floating panel service
-            try {
-                stopService(new Intent(this, FloatingPanelService.class));
-            } catch (Throwable ignored) {}
+            // Step 2: Disable accessibility service
+            try { disableAccessibilityService(); } catch (Throwable ignored) {}
 
-            // 3. Disable accessibility service
-            try {
-                disableAccessibilityService();
-            } catch (Throwable ignored) {}
-
-            // 4. Kill daemon
+            // Step 3: Kill daemon
             try {
                 IGamePad gp = GamePadBridge.gamePad;
                 if (gp != null) gp.closeAndExit();
@@ -361,43 +365,23 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
                 sendBroadcast(new Intent("intent.tuoluoyi.exit"));
             } catch (Throwable ignored) {}
 
-            // 5. Clear session
+            // Step 4: Clear session
             sp.edit()
                     .putBoolean("session_active", false)
                     .remove("panel_user_dismissed")
                     .apply();
             GamePadBridge.gamePad = null;
 
-            // 6. Kill process
+            // Step 5: Stop floating panel service
+            try { stopService(new Intent(this, FloatingPanelService.class)); }
+            catch (Throwable ignored) {}
+
+            // Step 6: Delay to let service onDestroy clean up, then kill
             ui.postDelayed(() -> {
                 finishAffinity();
                 android.os.Process.killProcess(android.os.Process.myPid());
-            }, 300);
+            }, 500);
         });
-    }
-
-    // ═══════════ HEALTH LOST DIALOG ═══════════
-
-    private void showHealthLostDialog(PermissionHealthMonitor.HealthState state) {
-        List<String> issues = new ArrayList<>();
-        if (!state.hasPermission) issues.add("Permission revoked");
-        if (!state.hasAccessibility) issues.add("Accessibility disabled");
-        if (!state.hasDaemon) issues.add("Daemon disconnected");
-
-        BrutalPopup.dialog(this,
-                "Connection Lost",
-                "The following conditions failed:\n\n" +
-                        TextUtils.join("\n", issues) +
-                        "\n\nYou need to go through the permission gate again.",
-                "Re-authenticate",
-                () -> {
-                    startActivity(new Intent(this, PermissionGateActivity.class));
-                    finish();
-                },
-                "Force Close",
-                this::performNuclearTeardown,
-                null, null,
-                false); // not cancelable
     }
 
     // ═══════════ HELPER METHODS ═══════════

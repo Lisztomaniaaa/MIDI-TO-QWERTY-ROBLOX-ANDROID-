@@ -8,87 +8,61 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.media.midi.MidiDeviceInfo;
-import android.media.midi.MidiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import androidx.core.content.ContextCompat;
 
+import java.io.OutputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Permission Gate — blocks entry to Home until ALL preconditions are met.
+ * Permission Gate — atomic activation flow.
  *
- * Checks (auto-retry every 2s):
- *   1. Root/Shizuku permission (WRITE_SECURE_SETTINGS granted)
- *   2. Accessibility Service enabled
- *   3. Daemon bridge alive (binder received + pingable)
- *   4. MIDI device detected (optional — warns but doesn't block)
+ * From the user's perspective there is ONE operation: "Activate".
+ * Internally it chains: ping source → grant perm → enable accessibility → spawn daemon → wait binder.
+ * User sees a single status line that progresses through steps.
  *
- * If all mandatory checks pass → Continue button appears → navigate to Home.
- * If any fail → show actionable "Fix" buttons where possible.
- *
- * This screen is NOT skippable. The only way past is having all conditions met.
+ * If ANY step fails → show which step failed + actionable message.
+ * ALL pass → auto-navigate to Home.
  */
 public class PermissionGateActivity extends Activity {
 
     private static final String TAG = "PermGate";
-    private static final long CHECK_INTERVAL_MS = 2000;
+    private static final long BINDER_TIMEOUT_MS = 10_000; // max wait for daemon binder
 
-    private TextView checkPermIcon, checkPermStatus;
-    private TextView checkAccIcon, checkAccStatus;
-    private TextView checkDaemonIcon, checkDaemonStatus;
-    private TextView checkMidiIcon, checkMidiStatus;
-    private TextView tvGateMessage;
-    private Button btnFixPermission, btnFixAccessibility;
-    private Button btnRetry, btnContinue;
+    private TextView tvStatus, tvDetail;
+    private ProgressBar progressBar;
+    private Button btnActivate, btnContinue;
+    private View cardRoot;
 
     private SharedPreferences sp;
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService bg = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "perm-gate-bg");
+        Thread t = new Thread(r, "activation-bg");
         t.setDaemon(true);
         return t;
     });
 
-    // Cached states
-    private volatile boolean hasPermission = false;
-    private volatile boolean hasAccessibility = false;
-    private volatile boolean hasDaemon = false;
-    private volatile boolean hasMidi = false;
-    private volatile String midiDeviceName = "";
-
+    private volatile boolean activating = false;
+    private volatile boolean binderArrived = false;
     private boolean receiverRegistered = false;
 
     private final BroadcastReceiver binderReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if ("intent.tuoluoyi.sendBinder".equals(intent.getAction())) {
-                // Daemon just sent its binder — trigger immediate recheck
-                handler.removeCallbacks(checkRunnable);
-                handler.post(checkRunnable);
+                binderArrived = true;
             }
-        }
-    };
-
-    private final Runnable checkRunnable = new Runnable() {
-        @Override
-        public void run() {
-            bg.execute(() -> {
-                performChecks();
-                handler.post(() -> updateUI());
-            });
-            // Schedule next check
-            handler.postDelayed(this, CHECK_INTERVAL_MS);
         }
     };
 
@@ -99,286 +73,227 @@ public class PermissionGateActivity extends Activity {
 
         sp = getSharedPreferences("data", 0);
 
-        bindViews();
-        setupListeners();
-        registerBroadcast();
-
-        // Start checking immediately
-        handler.post(checkRunnable);
-    }
-
-    private void bindViews() {
-        checkPermIcon = findViewById(R.id.check_permission_icon);
-        checkPermStatus = findViewById(R.id.check_permission_status);
-        checkAccIcon = findViewById(R.id.check_accessibility_icon);
-        checkAccStatus = findViewById(R.id.check_accessibility_status);
-        checkDaemonIcon = findViewById(R.id.check_daemon_icon);
-        checkDaemonStatus = findViewById(R.id.check_daemon_status);
-        checkMidiIcon = findViewById(R.id.check_midi_icon);
-        checkMidiStatus = findViewById(R.id.check_midi_status);
-        tvGateMessage = findViewById(R.id.tv_gate_message);
-        btnFixPermission = findViewById(R.id.btn_fix_permission);
-        btnFixAccessibility = findViewById(R.id.btn_fix_accessibility);
-        btnRetry = findViewById(R.id.btn_retry);
+        tvStatus = findViewById(R.id.tv_gate_status);
+        tvDetail = findViewById(R.id.tv_gate_detail);
+        progressBar = findViewById(R.id.progress_gate);
+        btnActivate = findViewById(R.id.btn_activate);
         btnContinue = findViewById(R.id.btn_continue);
-    }
 
-    private void setupListeners() {
-        btnFixPermission.setOnClickListener(v -> showActivationDialog());
+        btnActivate.setOnClickListener(v -> startActivation());
+        btnContinue.setOnClickListener(v -> navigateHome());
 
-        btnFixAccessibility.setOnClickListener(v -> {
-            // Try to enable via WRITE_SECURE_SETTINGS (if we have it)
-            if (hasPermission) {
-                bg.execute(() -> {
-                    enableAccessibilityService();
-                    handler.post(() -> {
-                        handler.removeCallbacks(checkRunnable);
-                        handler.post(checkRunnable);
-                    });
-                });
-            } else {
-                BrutalPopup.toast(this, "Fix permission first.", BrutalPopup.LENGTH_SHORT);
-            }
-        });
-
-        btnRetry.setOnClickListener(v -> {
-            handler.removeCallbacks(checkRunnable);
-            handler.post(checkRunnable);
-        });
-
-        btnContinue.setOnClickListener(v -> {
-            startActivity(new Intent(this, MainActivity.class));
-            overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
-            finish();
-        });
-    }
-
-    private void registerBroadcast() {
+        // Listen for daemon binder broadcast
         try {
-            IntentFilter filter = new IntentFilter("intent.tuoluoyi.sendBinder");
-            ContextCompat.registerReceiver(this, binderReceiver, filter,
+            IntentFilter f = new IntentFilter("intent.tuoluoyi.sendBinder");
+            ContextCompat.registerReceiver(this, binderReceiver, f,
                     ContextCompat.RECEIVER_EXPORTED);
             receiverRegistered = true;
         } catch (Throwable t) {
             Log.w(TAG, "registerReceiver", t);
         }
-    }
 
-    // ═══════════ BACKGROUND CHECKS (run on bg thread) ═══════════
-
-    private void performChecks() {
-        hasPermission = checkPermission();
-        hasAccessibility = checkAccessibility();
-        hasDaemon = checkDaemon();
-        hasMidi = checkMidiDevice();
-    }
-
-    private boolean checkPermission() {
-        return checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
-                == PackageManager.PERMISSION_GRANTED;
-    }
-
-    private boolean checkAccessibility() {
-        try {
-            String svcName = new ComponentName(getPackageName(),
-                    tuoluoyiService.class.getName()).flattenToString();
-            String enabled = Settings.Secure.getString(
-                    getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            return enabled != null && enabled.contains(svcName);
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private boolean checkDaemon() {
-        IGamePad gp = GamePadBridge.gamePad;
-        if (gp == null) return false;
-        try {
-            return gp.asBinder().pingBinder();
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private boolean checkMidiDevice() {
-        try {
-            MidiManager mm = (MidiManager) getSystemService(MIDI_SERVICE);
-            if (mm == null) return false;
-            MidiDeviceInfo[] devices = mm.getDevices();
-            if (devices == null) return false;
-            for (MidiDeviceInfo info : devices) {
-                if (info.getOutputPortCount() > 0) {
-                    String name = info.getProperties()
-                            .getString(MidiDeviceInfo.PROPERTY_NAME);
-                    midiDeviceName = (name != null) ? name : "Unknown Device";
-                    return true;
-                }
+        // Auto-check: if already fully activated, skip straight to Home
+        bg.execute(() -> {
+            if (isFullyActivated()) {
+                ui.post(this::navigateHome);
             }
-        } catch (Throwable t) {
-            Log.w(TAG, "checkMidi", t);
-        }
-        midiDeviceName = "";
-        return false;
+        });
     }
 
-    // ═══════════ UI UPDATE (main thread) ═══════════
+    // ═══════════ ATOMIC ACTIVATION ═══════════
 
-    private void updateUI() {
-        // Permission
-        setCheckState(checkPermIcon, checkPermStatus,
-                hasPermission,
-                hasPermission ? "Granted (" + sp.getString("activation_method", "shizuku") + ")"
-                              : "Not granted");
-        btnFixPermission.setVisibility(hasPermission ? View.GONE : View.VISIBLE);
+    private void startActivation() {
+        if (activating) return;
+        activating = true;
+        binderArrived = false;
 
-        // Accessibility
-        setCheckState(checkAccIcon, checkAccStatus,
-                hasAccessibility,
-                hasAccessibility ? "Enabled" : "Disabled");
-        btnFixAccessibility.setVisibility(hasAccessibility ? View.GONE : View.VISIBLE);
+        btnActivate.setEnabled(false);
+        btnContinue.setVisibility(View.GONE);
+        progressBar.setVisibility(View.VISIBLE);
 
-        // Daemon
-        setCheckState(checkDaemonIcon, checkDaemonStatus,
-                hasDaemon,
-                hasDaemon ? "Connected" : "Waiting for daemon...");
+        String method = sp.getString("activation_method", null);
 
-        // MIDI (optional — warn but don't block)
-        if (hasMidi) {
-            setCheckState(checkMidiIcon, checkMidiStatus, true, midiDeviceName);
-        } else {
-            checkMidiIcon.setText("!");
-            checkMidiIcon.setTextColor(ContextCompat.getColor(this, R.color.accent_gold));
-            checkMidiStatus.setText("No MIDI device (optional)");
-            checkMidiStatus.setTextColor(ContextCompat.getColor(this, R.color.text_muted));
+        if (method == null) {
+            // First time — ask user to choose
+            showMethodChoice();
+            return;
         }
 
-        // Overall state — mandatory: permission + accessibility + daemon
-        boolean allMandatoryPassed = hasPermission && hasAccessibility && hasDaemon;
-
-        if (allMandatoryPassed) {
-            tvGateMessage.setText("All systems ready!");
-            tvGateMessage.setTextColor(ContextCompat.getColor(this, R.color.green));
-            btnContinue.setVisibility(View.VISIBLE);
-            btnRetry.setVisibility(View.GONE);
-        } else {
-            int failCount = 0;
-            if (!hasPermission) failCount++;
-            if (!hasAccessibility) failCount++;
-            if (!hasDaemon) failCount++;
-            tvGateMessage.setText(failCount + " condition(s) not met. Auto-retrying...");
-            tvGateMessage.setTextColor(ContextCompat.getColor(this, R.color.text_secondary));
-            btnContinue.setVisibility(View.GONE);
-            btnRetry.setVisibility(View.VISIBLE);
-        }
+        bg.execute(() -> runActivation(method));
     }
 
-    private void setCheckState(TextView icon, TextView status, boolean passed, String text) {
-        if (passed) {
-            icon.setText("\u2713"); // checkmark
-            icon.setTextColor(ContextCompat.getColor(this, R.color.green));
-        } else {
-            icon.setText("\u2717"); // X mark
-            icon.setTextColor(ContextCompat.getColor(this, R.color.red));
-        }
-        status.setText(text);
-        status.setTextColor(ContextCompat.getColor(this,
-                passed ? R.color.green : R.color.text_muted));
-    }
-
-    // ═══════════ FIX ACTIONS ═══════════
-
-    private void showActivationDialog() {
-        java.io.File extDir = getExternalFilesDir(null);
-        final String cmd = "sh " + (extDir != null ? extDir.getPath() : getFilesDir().getPath())
-                + "/starter.sh";
+    private void showMethodChoice() {
+        activating = false;
+        btnActivate.setEnabled(true);
+        progressBar.setVisibility(View.GONE);
 
         BrutalPopup.dialog(this,
-                "Activate",
-                "Choose activation method:",
+                "Activation Method",
+                "Choose how to activate Papiano:",
                 "Root",
                 () -> {
                     sp.edit().putString("activation_method", "root").apply();
-                    bg.execute(() -> activateRoot(cmd));
+                    startActivation();
                 },
                 "Shizuku",
                 () -> {
                     sp.edit().putString("activation_method", "shizuku").apply();
-                    bg.execute(this::activateShizuku);
+                    startActivation();
                 },
                 null, null,
                 true);
     }
 
-    private void activateRoot(String cmd) {
+    /**
+     * Atomic activation — runs ALL steps sequentially on bg thread.
+     * Posts status updates to UI. Stops at first failure.
+     */
+    private void runActivation(String method) {
         try {
-            Process p = Runtime.getRuntime().exec("su");
-            java.io.OutputStream o = p.getOutputStream();
-            // Grant WRITE_SECURE_SETTINGS + run daemon
-            String grantCmd = "pm grant " + getPackageName()
-                    + " android.permission.WRITE_SECURE_SETTINGS\n";
-            o.write(grantCmd.getBytes());
-            o.write((cmd + "\nexit\n").getBytes());
-            o.flush();
-            o.close();
-            p.waitFor();
-            handler.post(() -> {
-                BrutalPopup.toast(this, "Root activation sent.", BrutalPopup.LENGTH_SHORT);
-                handler.removeCallbacks(checkRunnable);
-                handler.postDelayed(checkRunnable, 500);
-            });
-        } catch (Exception e) {
-            Log.e(TAG, "root activate", e);
-            handler.post(() -> BrutalPopup.toast(this,
-                    "Root not available.", BrutalPopup.LENGTH_SHORT));
-        }
-    }
+            // ── Step 1: Ping activation source ──
+            postStatus("Checking " + method + "...", "");
 
-    private void activateShizuku() {
-        try {
-            if (rikka.shizuku.Shizuku.checkSelfPermission()
-                    != PackageManager.PERMISSION_GRANTED) {
-                handler.post(() -> rikka.shizuku.Shizuku.requestPermission(0));
+            boolean sourceAlive = pingSource(method);
+            if (!sourceAlive) {
+                postFailed(capitalize(method) + " is not running.",
+                        method.equals("shizuku")
+                                ? "Open Shizuku app and make sure it's active."
+                                : "Root access not available.");
                 return;
             }
-            // Grant WRITE_SECURE_SETTINGS
-            Process p = rikka.shizuku.Shizuku.newProcess(new String[]{"sh"}, null, null);
-            java.io.OutputStream o = p.getOutputStream();
-            String grantCmd = "pm grant " + getPackageName()
-                    + " android.permission.WRITE_SECURE_SETTINGS\n";
-            o.write(grantCmd.getBytes());
-            o.flush();
-            o.close();
-            p.waitFor();
 
-            // Launch daemon
-            java.io.File extDir = getExternalFilesDir(null);
-            String base = extDir != null ? extDir.getPath() : getFilesDir().getPath();
-            Process p2 = rikka.shizuku.Shizuku.newProcess(new String[]{"sh"}, null, null);
-            java.io.OutputStream o2 = p2.getOutputStream();
-            o2.write(("sh " + base + "/starter.sh\nexit\n").getBytes());
-            o2.flush();
-            o2.close();
-            p2.waitFor();
+            // ── Step 2: Grant WRITE_SECURE_SETTINGS ──
+            postStatus("Granting permission...", "");
 
-            handler.post(() -> {
-                BrutalPopup.toast(this, "Shizuku activation sent.", BrutalPopup.LENGTH_SHORT);
-                handler.removeCallbacks(checkRunnable);
-                handler.postDelayed(checkRunnable, 1500);
-            });
-        } catch (Exception e) {
-            Log.e(TAG, "shizuku activate", e);
-            handler.post(() -> BrutalPopup.toast(this,
-                    "Shizuku not running.", BrutalPopup.LENGTH_SHORT));
+            boolean permGranted = grantPermission(method);
+            // Verify
+            Thread.sleep(300);
+            if (!hasWriteSecureSettings()) {
+                postFailed("Permission grant failed.",
+                        "Could not grant WRITE_SECURE_SETTINGS.");
+                return;
+            }
+
+            // ── Step 3: Enable Accessibility Service ──
+            postStatus("Enabling service...", "");
+
+            enableAccessibility();
+            Thread.sleep(500);
+            if (!isAccessibilityEnabled()) {
+                postFailed("Could not enable accessibility.",
+                        "Try enabling manually in Settings > Accessibility.");
+                return;
+            }
+
+            // ── Step 4: Spawn daemon ──
+            postStatus("Starting daemon...", "Waiting for connection...");
+
+            spawnDaemon(method);
+
+            // ── Step 5: Wait for binder (max BINDER_TIMEOUT_MS) ──
+            long deadline = System.currentTimeMillis() + BINDER_TIMEOUT_MS;
+            while (!binderArrived && System.currentTimeMillis() < deadline) {
+                // Also check GamePadBridge directly (might have been set by tuoluoyiService)
+                if (GamePadBridge.gamePad != null) {
+                    try {
+                        if (GamePadBridge.gamePad.asBinder().pingBinder()) {
+                            binderArrived = true;
+                            break;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                Thread.sleep(500);
+
+                long remaining = (deadline - System.currentTimeMillis()) / 1000;
+                postStatus("Starting daemon...", "Waiting... (" + remaining + "s)");
+            }
+
+            if (!binderArrived && GamePadBridge.gamePad == null) {
+                postFailed("Daemon did not respond.",
+                        "Timeout waiting for daemon binder. Try again.");
+                return;
+            }
+
+            // ── ALL STEPS PASSED ──
+            postSuccess();
+
+        } catch (InterruptedException e) {
+            postFailed("Activation interrupted.", "");
+        } catch (Throwable t) {
+            Log.e(TAG, "runActivation", t);
+            postFailed("Unexpected error: " + t.getMessage(), "");
+        } finally {
+            activating = false;
         }
     }
 
-    private void enableAccessibilityService() {
+    // ═══════════ SUB-STEPS ═══════════
+
+    private boolean pingSource(String method) {
+        switch (method) {
+            case "shizuku":
+                try {
+                    return rikka.shizuku.Shizuku.pingBinder();
+                } catch (Throwable t) {
+                    return false;
+                }
+            case "root":
+                try {
+                    Process p = Runtime.getRuntime().exec("su -c id");
+                    int exit = p.waitFor();
+                    return exit == 0;
+                } catch (Throwable t) {
+                    return false;
+                }
+            default:
+                return false;
+        }
+    }
+
+    private boolean grantPermission(String method) {
+        String cmd = "pm grant " + getPackageName()
+                + " android.permission.WRITE_SECURE_SETTINGS";
+        try {
+            switch (method) {
+                case "shizuku": {
+                    if (rikka.shizuku.Shizuku.checkSelfPermission()
+                            != PackageManager.PERMISSION_GRANTED) {
+                        // Request Shizuku permission synchronously-ish
+                        ui.post(() -> rikka.shizuku.Shizuku.requestPermission(0));
+                        Thread.sleep(2000); // wait for user to grant
+                        if (rikka.shizuku.Shizuku.checkSelfPermission()
+                                != PackageManager.PERMISSION_GRANTED) {
+                            return false;
+                        }
+                    }
+                    Process p = rikka.shizuku.Shizuku.newProcess(
+                            new String[]{"sh", "-c", cmd}, null, null);
+                    p.waitFor();
+                    return true;
+                }
+                case "root": {
+                    Process p = Runtime.getRuntime().exec("su");
+                    OutputStream o = p.getOutputStream();
+                    o.write((cmd + "\nexit\n").getBytes());
+                    o.flush();
+                    o.close();
+                    p.waitFor();
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "grantPermission", t);
+            return false;
+        }
+    }
+
+    private void enableAccessibility() {
         try {
             String svcName = new ComponentName(getPackageName(),
                     tuoluoyiService.class.getName()).flattenToString();
-            String current = Settings.Secure.getString(
-                    getContentResolver(),
+            String current = Settings.Secure.getString(getContentResolver(),
                     Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
             if (current == null) current = "";
             if (!current.contains(svcName)) {
@@ -388,27 +303,123 @@ public class PermissionGateActivity extends Activity {
                 Settings.Secure.putString(getContentResolver(),
                         Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, next);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "enableAccessibility", e);
-            handler.post(() -> BrutalPopup.toast(this,
-                    "Failed. Grant permission first.", BrutalPopup.LENGTH_SHORT));
+        } catch (Throwable t) {
+            Log.e(TAG, "enableAccessibility", t);
         }
+    }
+
+    private void spawnDaemon(String method) {
+        java.io.File extDir = getExternalFilesDir(null);
+        String base = extDir != null ? extDir.getPath() : getFilesDir().getPath();
+        String cmd = "sh " + base + "/starter.sh";
+
+        try {
+            switch (method) {
+                case "shizuku": {
+                    Process p = rikka.shizuku.Shizuku.newProcess(
+                            new String[]{"sh", "-c", cmd}, null, null);
+                    p.waitFor();
+                    break;
+                }
+                case "root": {
+                    Process p = Runtime.getRuntime().exec("su");
+                    OutputStream o = p.getOutputStream();
+                    o.write((cmd + "\nexit\n").getBytes());
+                    o.flush();
+                    o.close();
+                    p.waitFor();
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "spawnDaemon", t);
+        }
+    }
+
+    // ═══════════ STATE CHECKS ═══════════
+
+    private boolean hasWriteSecureSettings() {
+        return checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean isAccessibilityEnabled() {
+        try {
+            String svcName = new ComponentName(getPackageName(),
+                    tuoluoyiService.class.getName()).flattenToString();
+            String enabled = Settings.Secure.getString(getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            return enabled != null && enabled.contains(svcName);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Full activation = permission + accessibility + daemon binder alive */
+    private boolean isFullyActivated() {
+        if (!hasWriteSecureSettings()) return false;
+        if (!isAccessibilityEnabled()) return false;
+        IGamePad gp = GamePadBridge.gamePad;
+        if (gp == null) return false;
+        try { return gp.asBinder().pingBinder(); }
+        catch (Throwable t) { return false; }
+    }
+
+    // ═══════════ UI HELPERS ═══════════
+
+    private void postStatus(String status, String detail) {
+        ui.post(() -> {
+            tvStatus.setText(status);
+            tvStatus.setTextColor(ContextCompat.getColor(this, R.color.text_primary));
+            tvDetail.setText(detail);
+            tvDetail.setVisibility(detail.isEmpty() ? View.GONE : View.VISIBLE);
+            progressBar.setVisibility(View.VISIBLE);
+            btnActivate.setEnabled(false);
+        });
+    }
+
+    private void postFailed(String status, String detail) {
+        ui.post(() -> {
+            tvStatus.setText(status);
+            tvStatus.setTextColor(ContextCompat.getColor(this, R.color.red));
+            tvDetail.setText(detail);
+            tvDetail.setVisibility(detail.isEmpty() ? View.GONE : View.VISIBLE);
+            progressBar.setVisibility(View.GONE);
+            btnActivate.setEnabled(true);
+            btnActivate.setText("Retry");
+            btnContinue.setVisibility(View.GONE);
+        });
+    }
+
+    private void postSuccess() {
+        ui.post(() -> {
+            tvStatus.setText("Activated!");
+            tvStatus.setTextColor(ContextCompat.getColor(this, R.color.green));
+            tvDetail.setText("All systems ready. Tap Continue.");
+            tvDetail.setVisibility(View.VISIBLE);
+            tvDetail.setTextColor(ContextCompat.getColor(this, R.color.green));
+            progressBar.setVisibility(View.GONE);
+            btnActivate.setVisibility(View.GONE);
+            btnContinue.setVisibility(View.VISIBLE);
+        });
+    }
+
+    private void navigateHome() {
+        startActivity(new Intent(this, MainActivity.class));
+        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+        finish();
+    }
+
+    private String capitalize(String s) {
+        if (s == null || s.isEmpty()) return "";
+        return s.substring(0, 1).toUpperCase() + s.substring(1);
     }
 
     // ═══════════ LIFECYCLE ═══════════
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        // Immediate recheck when returning from settings
-        handler.removeCallbacks(checkRunnable);
-        handler.post(checkRunnable);
-    }
-
-    @Override
     protected void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacksAndMessages(null);
         if (receiverRegistered) {
             try { unregisterReceiver(binderReceiver); } catch (Throwable ignored) {}
         }
@@ -417,7 +428,6 @@ public class PermissionGateActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        // Go back to login (clears session)
         getSharedPreferences("data", 0).edit()
                 .putBoolean("session_active", false).apply();
         startActivity(new Intent(this, LoginActivity.class));

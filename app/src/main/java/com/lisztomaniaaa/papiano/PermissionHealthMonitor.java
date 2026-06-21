@@ -2,7 +2,7 @@ package com.lisztomaniaaa.papiano;
 
 import android.content.ComponentName;
 import android.content.Context;
-import android.content.pm.PackageManager;
+import android.content.SharedPreferences;
 import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
 import android.os.Handler;
@@ -16,71 +16,50 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Continuous permission/system health monitor.
+ * Simplified health monitor — checks activation health continuously.
  *
- * Polls every CHECK_INTERVAL_MS (2.5s) on a background thread.
- * When health transitions (healthy → unhealthy), fires callback on main thread.
- * UI components observe via {@link HealthCallback}.
+ * Two states only:
+ *   HEALTHY: activation source alive + binder alive
+ *   UNHEALTHY: something dropped
  *
- * Checks:
- *   1. WRITE_SECURE_SETTINGS granted (Root/Shizuku alive)
- *   2. Accessibility Service enabled
- *   3. Daemon binder alive (GamePadBridge.gamePad pingable)
- *   4. MIDI device(s) connected (informational, not blocking)
+ * On health loss: fires callback with reason. NO blocking modal.
+ * The callback receiver (MainActivity) shows a soft warning banner
+ * and the monitor keeps polling. If conditions recover (user restarts
+ * Shizuku, daemon auto-respawns), fires healthy callback → banner dismissed.
+ *
+ * Auto-recovery: when transitioning UNHEALTHY → HEALTHY, triggers
+ * re-activation attempt (spawn daemon if binder is missing but source is alive).
  */
 public class PermissionHealthMonitor {
 
     private static final String TAG = "HealthMon";
-    private static final long CHECK_INTERVAL_MS = 2500;
+    private static final long CHECK_INTERVAL_MS = 3000;
+
+    public enum Status { HEALTHY, UNHEALTHY, RECOVERING }
 
     public interface HealthCallback {
-        /** Called on main thread when health state changes. */
-        void onHealthChanged(HealthState state);
+        void onHealthChanged(Status status, String message, List<MidiDeviceEntry> devices);
     }
 
     public static class MidiDeviceEntry {
         public final int id;
         public final String name;
-        public final int type; // MidiDeviceInfo.TYPE_USB / TYPE_BLUETOOTH / TYPE_VIRTUAL
-        public boolean enabled; // user toggle
+        public final int type;
+        public boolean enabled;
 
         public MidiDeviceEntry(int id, String name, int type) {
             this.id = id;
             this.name = name;
             this.type = type;
-            // Default: hardware ON, virtual OFF
-            this.enabled = (type != MidiDeviceInfo.TYPE_VIRTUAL);
+            this.enabled = true; // hardware always on
         }
 
         public String getTypeBadge() {
             switch (type) {
                 case MidiDeviceInfo.TYPE_USB: return "USB";
                 case MidiDeviceInfo.TYPE_BLUETOOTH: return "BT";
-                case MidiDeviceInfo.TYPE_VIRTUAL: return "Virtual";
                 default: return "?";
             }
-        }
-    }
-
-    public static class HealthState {
-        public final boolean hasPermission;
-        public final boolean hasAccessibility;
-        public final boolean hasDaemon;
-        public final List<MidiDeviceEntry> midiDevices;
-        public final String activationMethod; // "shizuku" / "root" / "adb"
-
-        public HealthState(boolean perm, boolean acc, boolean daemon,
-                           List<MidiDeviceEntry> devices, String method) {
-            this.hasPermission = perm;
-            this.hasAccessibility = acc;
-            this.hasDaemon = daemon;
-            this.midiDevices = devices;
-            this.activationMethod = method;
-        }
-
-        /** All mandatory conditions met. */
-        public boolean isHealthy() {
-            return hasPermission && hasAccessibility && hasDaemon;
         }
     }
 
@@ -94,10 +73,7 @@ public class PermissionHealthMonitor {
 
     private HealthCallback callback;
     private volatile boolean running = false;
-    private volatile HealthState lastState = null;
-
-    // Track user's device enable/disable choices across refreshes
-    private final List<MidiDeviceEntry> trackedDevices = new ArrayList<>();
+    private volatile Status lastStatus = null;
 
     public PermissionHealthMonitor(Context context) {
         this.context = context.getApplicationContext();
@@ -118,38 +94,9 @@ public class PermissionHealthMonitor {
         mainHandler.removeCallbacksAndMessages(null);
     }
 
-    /** Force an immediate check (e.g., after user taps Refresh). */
     public void forceCheck() {
         mainHandler.removeCallbacksAndMessages(null);
-        bg.execute(() -> {
-            HealthState state = performCheck();
-            deliverResult(state);
-            if (running) scheduleCheck();
-        });
-    }
-
-    /** Get last known state without triggering a new check. */
-    public HealthState getLastState() {
-        return lastState;
-    }
-
-    /** Get tracked MIDI device list (preserves user toggles). */
-    public List<MidiDeviceEntry> getTrackedDevices() {
-        synchronized (trackedDevices) {
-            return new ArrayList<>(trackedDevices);
-        }
-    }
-
-    /** Toggle a device on/off by its ID. */
-    public void toggleDevice(int deviceId, boolean enabled) {
-        synchronized (trackedDevices) {
-            for (MidiDeviceEntry entry : trackedDevices) {
-                if (entry.id == deviceId) {
-                    entry.enabled = enabled;
-                    break;
-                }
-            }
-        }
+        bg.execute(this::runCheck);
     }
 
     public void destroy() {
@@ -157,72 +104,82 @@ public class PermissionHealthMonitor {
         bg.shutdownNow();
     }
 
+    public Status getLastStatus() {
+        return lastStatus;
+    }
+
     // ═══════════ INTERNAL ═══════════
 
     private void scheduleCheck() {
         mainHandler.postDelayed(() -> {
             if (!running) return;
-            bg.execute(() -> {
-                HealthState state = performCheck();
-                deliverResult(state);
-                if (running) scheduleCheck();
-            });
+            bg.execute(this::runCheck);
         }, CHECK_INTERVAL_MS);
     }
 
-    private void deliverResult(HealthState state) {
-        boolean changed = (lastState == null)
-                || (lastState.isHealthy() != state.isHealthy())
-                || (lastState.hasPermission != state.hasPermission)
-                || (lastState.hasAccessibility != state.hasAccessibility)
-                || (lastState.hasDaemon != state.hasDaemon)
-                || (lastState.midiDevices.size() != state.midiDevices.size());
-        lastState = state;
-        // Always deliver (UI may need to update MIDI list even if health unchanged)
+    private void runCheck() {
+        boolean sourceAlive = checkSourceAlive();
+        boolean binderAlive = checkBinderAlive();
+        List<MidiDeviceEntry> devices = scanHardwareMidiDevices();
+
+        Status newStatus;
+        String message;
+
+        if (sourceAlive && binderAlive) {
+            newStatus = Status.HEALTHY;
+            message = "Active";
+        } else if (sourceAlive && !binderAlive) {
+            // Source alive but binder dead — daemon probably crashed, can auto-recover
+            newStatus = Status.RECOVERING;
+            message = "Daemon disconnected. Auto-recovering...";
+            attemptAutoRecovery();
+        } else {
+            newStatus = Status.UNHEALTHY;
+            String method = getMethod();
+            message = capitalize(method) + " is not running. Please restart it.";
+        }
+
+        final Status fStatus = newStatus;
+        final String fMessage = message;
+        final List<MidiDeviceEntry> fDevices = devices;
+
         mainHandler.post(() -> {
-            if (callback != null) callback.onHealthChanged(state);
+            lastStatus = fStatus;
+            if (callback != null) {
+                callback.onHealthChanged(fStatus, fMessage, fDevices);
+            }
         });
+
+        if (running) scheduleCheck();
     }
 
-    private HealthState performCheck() {
-        boolean perm = checkPermission();
-        boolean acc = checkAccessibility();
-        boolean daemon = checkDaemon();
-        List<MidiDeviceEntry> devices = scanMidiDevices();
-        String method = context.getSharedPreferences("data", 0)
-                .getString("activation_method", "shizuku");
-        return new HealthState(perm, acc, daemon, devices, method);
-    }
-
-    private boolean checkPermission() {
-        return context.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
-                == PackageManager.PERMISSION_GRANTED;
-    }
-
-    private boolean checkAccessibility() {
-        try {
-            String svcName = new ComponentName(context.getPackageName(),
-                    tuoluoyiService.class.getName()).flattenToString();
-            String enabled = Settings.Secure.getString(
-                    context.getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            return enabled != null && enabled.contains(svcName);
-        } catch (Throwable t) {
-            return false;
+    private boolean checkSourceAlive() {
+        String method = getMethod();
+        switch (method) {
+            case "shizuku":
+                try { return rikka.shizuku.Shizuku.pingBinder(); }
+                catch (Throwable t) { return false; }
+            case "root":
+                try {
+                    Process p = Runtime.getRuntime().exec("su -c id");
+                    return p.waitFor() == 0;
+                } catch (Throwable t) { return false; }
+            default:
+                return false;
         }
     }
 
-    private boolean checkDaemon() {
+    private boolean checkBinderAlive() {
         IGamePad gp = GamePadBridge.gamePad;
         if (gp == null) return false;
-        try {
-            return gp.asBinder().pingBinder();
-        } catch (Throwable t) {
-            return false;
-        }
+        try { return gp.asBinder().pingBinder(); }
+        catch (Throwable t) { return false; }
     }
 
-    private List<MidiDeviceEntry> scanMidiDevices() {
+    /**
+     * Scan MIDI devices — ONLY hardware (USB/BT). Virtual devices filtered out.
+     */
+    private List<MidiDeviceEntry> scanHardwareMidiDevices() {
         List<MidiDeviceEntry> result = new ArrayList<>();
         try {
             MidiManager mm = (MidiManager) context.getSystemService(Context.MIDI_SERVICE);
@@ -231,47 +188,64 @@ public class PermissionHealthMonitor {
             if (devices == null) return result;
 
             for (MidiDeviceInfo info : devices) {
-                if (info.getOutputPortCount() > 0) {
-                    String name = info.getProperties()
-                            .getString(MidiDeviceInfo.PROPERTY_NAME);
-                    if (name == null || name.isEmpty()) name = "Unknown Device";
-                    result.add(new MidiDeviceEntry(info.getId(), name, info.getType()));
-                }
+                // Skip virtual devices entirely
+                if (info.getType() == MidiDeviceInfo.TYPE_VIRTUAL) continue;
+                if (info.getOutputPortCount() <= 0) continue;
+
+                String name = info.getProperties()
+                        .getString(MidiDeviceInfo.PROPERTY_NAME);
+                if (name == null || name.isEmpty()) name = "Unknown Device";
+                result.add(new MidiDeviceEntry(info.getId(), name, info.getType()));
             }
         } catch (Throwable t) {
             Log.w(TAG, "scanMidi", t);
         }
-
-        // Merge with tracked list (preserve user toggles)
-        synchronized (trackedDevices) {
-            // Remove devices no longer present
-            trackedDevices.removeIf(tracked ->
-                    result.stream().noneMatch(r -> r.id == tracked.id));
-            // Add new devices, preserve existing toggle states
-            for (MidiDeviceEntry newDev : result) {
-                boolean found = false;
-                for (MidiDeviceEntry tracked : trackedDevices) {
-                    if (tracked.id == newDev.id) {
-                        newDev.enabled = tracked.enabled; // preserve toggle
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    trackedDevices.add(newDev);
-                }
-            }
-            // Update enabled states in result from tracked
-            for (MidiDeviceEntry r : result) {
-                for (MidiDeviceEntry t : trackedDevices) {
-                    if (r.id == t.id) {
-                        r.enabled = t.enabled;
-                        break;
-                    }
-                }
-            }
-        }
-
         return result;
+    }
+
+    /**
+     * Auto-recovery: re-spawn daemon if source is alive but binder is dead.
+     * Non-blocking — fires and forgets, next health check will verify.
+     */
+    private void attemptAutoRecovery() {
+        String method = getMethod();
+        java.io.File extDir = context.getExternalFilesDir(null);
+        String base = extDir != null ? extDir.getPath() : context.getFilesDir().getPath();
+        String cmd = "sh " + base + "/starter.sh";
+
+        try {
+            switch (method) {
+                case "shizuku": {
+                    if (rikka.shizuku.Shizuku.checkSelfPermission()
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+                    Process p = rikka.shizuku.Shizuku.newProcess(
+                            new String[]{"sh", "-c", cmd}, null, null);
+                    p.waitFor();
+                    break;
+                }
+                case "root": {
+                    Process p = Runtime.getRuntime().exec("su");
+                    java.io.OutputStream o = p.getOutputStream();
+                    o.write((cmd + "\nexit\n").getBytes());
+                    o.flush();
+                    o.close();
+                    p.waitFor();
+                    break;
+                }
+            }
+            Log.d(TAG, "Auto-recovery: daemon respawn attempted via " + method);
+        } catch (Throwable t) {
+            Log.w(TAG, "autoRecovery failed", t);
+        }
+    }
+
+    private String getMethod() {
+        return context.getSharedPreferences("data", 0)
+                .getString("activation_method", "shizuku");
+    }
+
+    private String capitalize(String s) {
+        if (s == null || s.isEmpty()) return "";
+        return s.substring(0, 1).toUpperCase() + s.substring(1);
     }
 }
