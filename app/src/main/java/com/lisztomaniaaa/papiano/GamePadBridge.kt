@@ -21,10 +21,10 @@ package com.lisztomaniaaa.papiano
  * midi-player HandlerThread.
  */
 object GamePadBridge {
-    @Volatile
+    @JvmField @Volatile
     var gamePad: IGamePad? = null
 
     /** Mirror of the velocity toggle so direct callers can gate without prefs. */
-    @Volatile
+    @JvmField @Volatile
     var velocityEnabled: Boolean = false
 }
