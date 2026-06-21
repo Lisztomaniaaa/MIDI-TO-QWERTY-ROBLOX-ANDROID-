@@ -1,11 +1,7 @@
 package com.lisztomaniaaa.papiano;
 
 import android.app.Activity;
-import android.app.NotificationManager;
-import android.app.Service;
 import android.content.BroadcastReceiver;
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -13,17 +9,20 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.media.midi.MidiDeviceInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.View;
 import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 
@@ -31,7 +30,6 @@ import androidx.core.content.ContextCompat;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -43,42 +41,36 @@ import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
-import rikka.shizuku.Shizuku;
-
 /**
- * Simplified main screen.
+ * Home screen — shown ONLY after login + permission gate passes.
  *
- * Layout (top -> bottom):
- *   1. Permission card    -> Activate button + status text
- *   2. Service card       -> Start Playing button + status text
- *   3. MIDI Device card   -> read-only device name
- *   4. Close App button
+ * Layout:
+ *   1. Connection status card (green/red + method)
+ *   2. Start Playing button (gated by health monitor)
+ *   3. MIDI devices list (toggle ON/OFF per device + refresh)
+ *   4. Velocity toggle
+ *   5. Force Close button (nuclear teardown)
  *
- * No popup window. Service runs entirely in the background once Start Playing is on.
- * Mode is hard-locked to QWERTY; no MIDI/PianoRooms mode, no octave/floating settings.
- *
- * IMPORTANT: Pada device tertentu (POCO X3 Pro / MIUI 14, sesuai bug report user)
- * system_server bisa stuck di UsbHostManager deadlock saat USB MIDI di-colok. Kalau
- * kita panggil binder API (Settings.Secure, MidiManager) sync di main thread, app
- * langsung ANR / "open langsung crash". Semua call begitu di-pindahin ke background
- * executor di sini, hasilnya di-post balik ke UI thread.
+ * Permission Health Monitor runs continuously. If health drops
+ * (permission revoked, daemon dies, etc.) → instant modal blocking UI,
+ * user must re-authenticate (back to PermissionGate or Login).
  */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements PermissionHealthMonitor.HealthCallback {
+
     public static final String TAG = "PapianoMidi";
 
-    boolean isListenerAdded = false;
-    boolean isBroadcastRegistered = false;
+    private View statusDot;
+    private TextView tvConnectionStatus, tvConnectionMethod;
+    private Button btnStart, btnRefreshMidi, btnForceClose;
+    private LinearLayout midiDeviceList;
+    private TextView tvNoDevices;
+    private Switch swVelocity;
 
-    Button activateBtn;
-    Button startBtn;
-    TextView tvPermissionStatus;
-    TextView tvServiceStatus;
+    private SharedPreferences sp;
+    private PermissionHealthMonitor healthMonitor;
 
-    SharedPreferences sp;
-
-    /** Cache hasil isAccessibilityEnabled() biar refreshServiceStatus() di UI thread
-     *  gak nge-trigger Binder call sync. Update-nya via background executor. */
-    private volatile boolean cachedAccessibilityEnabled = false;
+    private volatile boolean isServiceRunning = false;
+    private boolean isBroadcastRegistered = false;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService bg = Executors.newSingleThreadExecutor(r -> {
@@ -87,205 +79,76 @@ public class MainActivity extends Activity {
         return t;
     });
 
-    private final Shizuku.OnRequestPermissionResultListener SHIZUKU_LISTENER =
-            (requestCode, grantResult) -> {
-                if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                    bg.execute(() -> {
-                        grantWriteSecureSettingsViaShizuku();
-                        launchViaShizuku();
-                        ui.post(this::refreshPermissionStatus);
-                    });
-                }
-            };
-
-    private final BroadcastReceiver mBroadcastReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            try {
-                if (intent.getAction() == null) return;
-                switch (intent.getAction()) {
-                    case "intent.tuoluoyi.sendBinder":
-                        IBinder binder = extractBinder(intent);
-                        if (binder == null || !binder.pingBinder()) return;
-                        onDaemonReady();
-                        break;
-                    case "intent.tuoluoyi.exit":
-                        onDaemonStopped();
-                        break;
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "BroadcastReceiver onReceive error", t);
+            if (intent.getAction() == null) return;
+            switch (intent.getAction()) {
+                case "intent.tuoluoyi.sendBinder":
+                    // Daemon ready — force health check
+                    healthMonitor.forceCheck();
+                    break;
+                case "intent.tuoluoyi.exit":
+                    healthMonitor.forceCheck();
+                    break;
             }
         }
     };
 
-    /**
-     * Daemon LAMA (sebelum package rename ke com.lisztomaniaaa.papiano) bisa
-     * masih hidup di shell uid 2000 — process Shizuku-spawned gak ke-kill pas
-     * APK lama uninstall. Daemon itu kirim broadcast pake BinderContainer dari
-     * package legacy com.tile.tuoluoyi. Tanpa fallback ini, getParcelableExtra
-     * langsung lempar BadParcelableException → app crash.
-     *
-     * Strategi: support DUA package class (legacy + sekarang). Kalau yg dateng
-     * legacy, kita ambil binder-nya, lalu kirim signal exit biar daemon lama
-     * mati. Daemon baru nanti naik dari aktivasi user.
-     */
-    private IBinder extractBinder(Intent intent) {
-        try {
-            Object raw = intent.getParcelableExtra("binder");
-            if (raw instanceof BinderContainer) {
-                return ((BinderContainer) raw).getBinder();
-            }
-            if (raw instanceof com.tile.tuoluoyi.BinderContainer) {
-                Log.w(TAG, "Legacy daemon detected (com.tile.tuoluoyi.*) - sending exit");
-                try { sendBroadcast(new Intent("intent.tuoluoyi.exit")); } catch (Throwable ignored) {}
-                return ((com.tile.tuoluoyi.BinderContainer) raw).getBinder();
-            }
-            return null;
-        } catch (Throwable t) {
-            Log.w(TAG, "extractBinder failed (stale daemon?): " + t.getClass().getSimpleName());
-            try { sendBroadcast(new Intent("intent.tuoluoyi.exit")); } catch (Throwable ignored) {}
-            return null;
-        }
-    }
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        installCrashHandler();
+        setContentView(R.layout.activity_main);
 
-        try {
-            setContentView(R.layout.activity_main);
+        sp = getSharedPreferences("data", 0);
 
-            sp = getSharedPreferences("data", 0);
-            if (sp.getBoolean("first", true)) showWelcome();
+        // Unzip daemon files in background
+        bg.execute(this::unzipFiles);
 
-            // Unzip jangan di main thread - getAssets/ZipFile bisa lama.
-            bg.execute(this::unzipFiles);
+        bindViews();
+        setupListeners();
+        registerReceivers();
 
-            // Register receiver di main (cheap). Pisah try biar satu fail
-            // gak nyeret yg lain.
-            try {
-                IntentFilter daemonFilter = new IntentFilter("intent.tuoluoyi.sendBinder");
-                ContextCompat.registerReceiver(this, mBroadcastReceiver, daemonFilter,
-                        ContextCompat.RECEIVER_EXPORTED);
+        // Start health monitor
+        healthMonitor = new PermissionHealthMonitor(this);
+        healthMonitor.setCallback(this);
+        healthMonitor.start();
 
-                IntentFilter internalFilter = new IntentFilter();
-                internalFilter.addAction("intent.tuoluoyi.exit");
-                ContextCompat.registerReceiver(this, mBroadcastReceiver, internalFilter,
-                        ContextCompat.RECEIVER_NOT_EXPORTED);
-                isBroadcastRegistered = true;
-            } catch (Throwable t) { Log.e(TAG, "registerReceiver", t); }
-
-            bindViews();
-            refreshPermissionStatus();
-            refreshServiceStatus();   // UI dgn cached value (false) dulu
-            refreshAccessibilityCacheAsync();  // baru kick refresh asli di bg
-
-            // Defer requestBatteryExemption ke akhir + di bg, intent system
-            // bisa lambat di MIUI.
-            ui.postDelayed(() -> bg.execute(this::requestBatteryExemption), 500);
-        } catch (Throwable t) {
-            Log.e(TAG, "onCreate fatal", t);
-            showCrashDialog(t);
-        }
-    }
-
-    private void installCrashHandler() {
-        final Thread.UncaughtExceptionHandler prev =
-                Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
-            try {
-                Log.e(TAG, "UNCAUGHT on " + thread.getName(), throwable);
-                java.io.File dir = getExternalFilesDir(null);
-                if (dir != null) {
-                    java.io.File f = new java.io.File(dir, "last_crash.txt");
-                    java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(f));
-                    pw.println("Thread: " + thread.getName());
-                    pw.println("Time: " + new java.util.Date());
-                    throwable.printStackTrace(pw);
-                    pw.close();
-                }
-            } catch (Throwable ignored) {}
-            if (prev != null) prev.uncaughtException(thread, throwable);
-        });
-    }
-
-    private void showCrashDialog(Throwable t) {
-        java.io.StringWriter sw = new java.io.StringWriter();
-        t.printStackTrace(new java.io.PrintWriter(sw));
-        final String trace = sw.toString();
-        try {
-            BrutalPopup.dialog(this,
-                    "Papiano crashed",
-                    trace,
-                    "Copy trace",
-                    () -> {
-                        ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
-                                .setPrimaryClip(ClipData.newPlainText("crash", trace));
-                        BrutalPopup.toast(this, "Stack trace copied", BrutalPopup.LENGTH_SHORT);
-                    },
-                    "Close", this::finish,
-                    null, null,
-                    false);
-        } catch (Throwable t2) {
-            BrutalPopup.toast(this, "Crash: " + t.getClass().getSimpleName()
-                    + " - " + t.getMessage(), BrutalPopup.LENGTH_LONG);
-        }
+        // Request battery exemption in background
+        ui.postDelayed(() -> bg.execute(this::requestBatteryExemption), 500);
     }
 
     private void bindViews() {
-        activateBtn = findViewById(R.id.b);
-        startBtn = findViewById(R.id.btn_start_playing);
-        tvPermissionStatus = findViewById(R.id.tv_permission_status);
-        tvServiceStatus = findViewById(R.id.tv_service_status);
+        statusDot = findViewById(R.id.status_dot);
+        tvConnectionStatus = findViewById(R.id.tv_connection_status);
+        tvConnectionMethod = findViewById(R.id.tv_connection_method);
+        btnStart = findViewById(R.id.btn_start);
+        btnRefreshMidi = findViewById(R.id.btn_refresh_midi);
+        btnForceClose = findViewById(R.id.btn_force_close);
+        midiDeviceList = findViewById(R.id.midi_device_list);
+        tvNoDevices = findViewById(R.id.tv_no_devices);
+        swVelocity = findViewById(R.id.sw_velocity);
 
-        activateBtn.setOnClickListener(v -> showActivationDialog());
-
-        startBtn.setOnClickListener(v -> {
-            if (!hasWriteSecureSettings()) {
-                BrutalPopup.toast(this,
-                        "Activate the permission first.", BrutalPopup.LENGTH_SHORT);
-                return;
-            }
-            if (!cachedAccessibilityEnabled && !canDrawOverlays()) {
-                showOverlayPermissionDialog();
-                return;
-            }
-            // wantStart = user lagi mau ON-in service. Capture sebelum toggle
-            // karena toggleAccessibility async (refresh cache di bg thread).
-            final boolean wantStart = !cachedAccessibilityEnabled;
-            toggleAccessibility();
-
-            if (wantStart && canDrawOverlays()) {
-                // User pencet Start = niat eksplisit pengen aktif. Reset
-                // dismissed flag biar panel boleh muncul lagi (kalau
-                // sebelumnya user pernah close pake ✕).
-                sp.edit().remove("panel_user_dismissed").apply();
-                startFloatingPanel();
-            }
-            // Kalau wantStart=false (user lagi STOP), panel mati lewat
-            // intent.tuoluoyi.exit yg di-broadcast di toggleAccessibility().
-        });
-
-        Button closeBtn = findViewById(R.id.btn_force_close);
-        closeBtn.setOnClickListener(v -> BrutalPopup.dialog(this,
-                getString(R.string.close_app_title),
-                getString(R.string.close_app_text),
-                getString(R.string.close),
-                () -> {
-                    sendBroadcast(new Intent("intent.tuoluoyi.exit"));
-                    android.os.Process.killProcess(android.os.Process.myPid());
-                },
-                getString(R.string.cancel), null,
-                null, null,
-                true));
-
-        // Velocity toggle ("Visual Piano" dynamics). Persist ke pref
-        // "velocity_enabled" + broadcast ke tuoluoyiService biar update live
-        // tanpa restart service.
-        Switch swVelocity = findViewById(R.id.sw_velocity);
+        // Restore velocity state
         swVelocity.setChecked(sp.getBoolean("velocity_enabled", false));
+    }
+
+    private void setupListeners() {
+        btnStart.setOnClickListener(v -> togglePlayback());
+
+        btnRefreshMidi.setOnClickListener(v -> healthMonitor.forceCheck());
+
+        btnForceClose.setOnClickListener(v ->
+            BrutalPopup.dialog(this,
+                "Force Close",
+                "This will kill everything: daemon, service, session. You will need to re-authenticate on next launch.",
+                "Force Close",
+                this::performNuclearTeardown,
+                "Cancel", null,
+                null, null,
+                true)
+        );
+
         swVelocity.setOnCheckedChangeListener((btn, checked) -> {
             sp.edit().putBoolean("velocity_enabled", checked).apply();
             try {
@@ -293,160 +156,280 @@ public class MainActivity extends Activity {
                         .setPackage(getPackageName())
                         .putExtra("enabled", checked));
             } catch (Throwable t) {
-                Log.w(TAG, "broadcast set_velocity", t);
+                Log.w(TAG, "broadcast velocity", t);
             }
         });
     }
 
-    /* ---------------- PERMISSION ---------------- */
-
-    private boolean hasWriteSecureSettings() {
-        return checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
-                == PackageManager.PERMISSION_GRANTED;
-    }
-
-    private void refreshPermissionStatus() {
-        if (hasWriteSecureSettings()) {
-            String method = sp.getString("activation_method", "shizuku");
-            int label;
-            switch (method) {
-                case "root": label = R.string.permission_granted_root; break;
-                case "adb":  label = R.string.permission_granted_adb;  break;
-                default:     label = R.string.permission_granted_shizuku;
-            }
-            tvPermissionStatus.setText(label);
-            tvPermissionStatus.setTextColor(ContextCompat.getColor(this, R.color.green));
-            activateBtn.setText(R.string.activated);
-            activateBtn.setBackgroundTintList(ColorStateList.valueOf(
-                    ContextCompat.getColor(this, R.color.green)));
-        } else {
-            tvPermissionStatus.setText(R.string.permission_not_granted);
-            tvPermissionStatus.setTextColor(ContextCompat.getColor(this, R.color.red));
-            activateBtn.setText(R.string.activate);
-            activateBtn.setBackgroundTintList(ColorStateList.valueOf(
-                    ContextCompat.getColor(this, R.color.red)));
-        }
-    }
-
-    private void showActivationDialog() {
-        java.io.File extDir = getExternalFilesDir(null);
-        final String cmd = "sh " + (extDir != null ? extDir.getPath() : getFilesDir().getPath())
-                + "/starter.sh";
-        BrutalPopup.dialog(this,
-                getString(R.string.active_title),
-                getString(R.string.active_text),
-                "Root",
-                () -> {
-                    sp.edit().putString("activation_method", "root").apply();
-                    bg.execute(() -> {
-                        try {
-                            Process p = Runtime.getRuntime().exec("su");
-                            OutputStream o = p.getOutputStream();
-                            o.write((cmd + "\nexit\n").getBytes()); o.flush(); o.close();
-                            ui.post(() -> BrutalPopup.toast(this,
-                                    "Activation script sent to root shell.",
-                                    BrutalPopup.LENGTH_SHORT));
-                        } catch (IOException ex) {
-                            Log.e(TAG, "root", ex);
-                            ui.post(() -> BrutalPopup.toast(this,
-                                    "Root not available.",
-                                    BrutalPopup.LENGTH_SHORT));
-                        }
-                    });
-                },
-                "Shizuku",
-                () -> {
-                    sp.edit().putString("activation_method", "shizuku").apply();
-                    bg.execute(this::launchViaShizuku);
-                },
-                getString(R.string.copy_cmd),
-                () -> {
-                    sp.edit().putString("activation_method", "adb").apply();
-                    ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
-                            .setPrimaryClip(ClipData.newPlainText("c", "adb shell " + cmd));
-                    BrutalPopup.toast(this, "ADB command copied to clipboard.",
-                            BrutalPopup.LENGTH_LONG);
-                },
-                true);
-    }
-
-    /* ---------------- SERVICE (accessibility) ---------------- */
-
-    /** Background-only. Settings.Secure binder call. */
-    private boolean readAccessibilityEnabledBlocking() {
+    private void registerReceivers() {
         try {
-            String svcName = new ComponentName(getPackageName(),
-                    tuoluoyiService.class.getName()).flattenToString();
-            String set = Settings.Secure.getString(getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            return set != null && set.contains(svcName);
+            IntentFilter f1 = new IntentFilter("intent.tuoluoyi.sendBinder");
+            ContextCompat.registerReceiver(this, receiver, f1,
+                    ContextCompat.RECEIVER_EXPORTED);
+            IntentFilter f2 = new IntentFilter("intent.tuoluoyi.exit");
+            ContextCompat.registerReceiver(this, receiver, f2,
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
+            isBroadcastRegistered = true;
         } catch (Throwable t) {
-            Log.w(TAG, "readAccessibilityEnabled failed", t);
-            return false;
+            Log.e(TAG, "registerReceiver", t);
         }
     }
 
-    private void refreshAccessibilityCacheAsync() {
-        bg.execute(() -> {
-            boolean v = readAccessibilityEnabledBlocking();
-            if (v != cachedAccessibilityEnabled) {
-                cachedAccessibilityEnabled = v;
-                ui.post(this::refreshServiceStatus);
+    // ═══════════ HEALTH MONITOR CALLBACK ═══════════
+
+    @Override
+    public void onHealthChanged(PermissionHealthMonitor.HealthState state) {
+        updateConnectionCard(state);
+        updateMidiDeviceList(state.midiDevices);
+        updateStartButton(state);
+
+        // If health drops while on Home → show blocking modal
+        if (!state.isHealthy() && isServiceRunning) {
+            isServiceRunning = false;
+            showHealthLostDialog(state);
+        }
+    }
+
+    private void updateConnectionCard(PermissionHealthMonitor.HealthState state) {
+        if (state.isHealthy()) {
+            statusDot.setBackgroundTintList(ColorStateList.valueOf(
+                    ContextCompat.getColor(this, R.color.green)));
+            tvConnectionStatus.setText("Active");
+            tvConnectionStatus.setTextColor(ContextCompat.getColor(this, R.color.green));
+            tvConnectionMethod.setText("via " + capitalize(state.activationMethod));
+        } else {
+            statusDot.setBackgroundTintList(ColorStateList.valueOf(
+                    ContextCompat.getColor(this, R.color.red)));
+            tvConnectionStatus.setText("Unhealthy");
+            tvConnectionStatus.setTextColor(ContextCompat.getColor(this, R.color.red));
+
+            List<String> issues = new ArrayList<>();
+            if (!state.hasPermission) issues.add("permission");
+            if (!state.hasAccessibility) issues.add("accessibility");
+            if (!state.hasDaemon) issues.add("daemon");
+            tvConnectionMethod.setText("Missing: " + TextUtils.join(", ", issues));
+        }
+    }
+
+    private void updateStartButton(PermissionHealthMonitor.HealthState state) {
+        if (!state.isHealthy()) {
+            btnStart.setText("Reconnect Required");
+            btnStart.setBackgroundTintList(ColorStateList.valueOf(
+                    ContextCompat.getColor(this, R.color.text_muted)));
+            btnStart.setEnabled(false);
+        } else {
+            btnStart.setEnabled(true);
+            if (isServiceRunning) {
+                btnStart.setText("Stop Playing");
+                btnStart.setBackgroundTintList(ColorStateList.valueOf(
+                        ContextCompat.getColor(this, R.color.text_muted)));
+            } else {
+                btnStart.setText("Start Playing");
+                btnStart.setBackgroundTintList(ColorStateList.valueOf(
+                        ContextCompat.getColor(this, R.color.accent_primary)));
             }
-        });
+        }
     }
 
-    private void refreshServiceStatus() {
-        boolean running = cachedAccessibilityEnabled;
-        tvServiceStatus.setText(running ? R.string.service_running : R.string.service_stopped);
-        tvServiceStatus.setTextColor(ContextCompat.getColor(this,
-                running ? R.color.green : R.color.text_muted));
-        startBtn.setText(running ? R.string.stop_playing : R.string.start_playing);
-        startBtn.setBackgroundTintList(ColorStateList.valueOf(
-                ContextCompat.getColor(this,
-                        running ? R.color.text_muted : R.color.accent_primary)));
+    private void updateMidiDeviceList(List<PermissionHealthMonitor.MidiDeviceEntry> devices) {
+        midiDeviceList.removeAllViews();
+
+        if (devices.isEmpty()) {
+            tvNoDevices.setVisibility(View.VISIBLE);
+            midiDeviceList.addView(tvNoDevices);
+            return;
+        }
+
+        tvNoDevices.setVisibility(View.GONE);
+
+        for (PermissionHealthMonitor.MidiDeviceEntry device : devices) {
+            View row = LayoutInflater.from(this)
+                    .inflate(R.layout.item_midi_device, midiDeviceList, false);
+
+            TextView tvName = row.findViewById(R.id.tv_device_name);
+            TextView tvBadge = row.findViewById(R.id.tv_device_badge);
+            Switch swToggle = row.findViewById(R.id.sw_device_toggle);
+
+            tvName.setText(device.name);
+            tvBadge.setText(device.getTypeBadge());
+
+            // Color-code badge by type
+            int badgeColor;
+            switch (device.type) {
+                case MidiDeviceInfo.TYPE_USB:
+                    badgeColor = R.color.green;
+                    break;
+                case MidiDeviceInfo.TYPE_BLUETOOTH:
+                    badgeColor = R.color.accent_primary;
+                    break;
+                default:
+                    badgeColor = R.color.text_muted;
+                    break;
+            }
+            tvBadge.setTextColor(ContextCompat.getColor(this, badgeColor));
+
+            swToggle.setChecked(device.enabled);
+            swToggle.setOnCheckedChangeListener((btn, checked) -> {
+                healthMonitor.toggleDevice(device.id, checked);
+                // TODO: notify tuoluoyiService of device enable/disable
+            });
+
+            midiDeviceList.addView(row);
+        }
     }
 
-    private void toggleAccessibility() {
-        final String svcName = new ComponentName(getPackageName(),
-                tuoluoyiService.class.getName()).flattenToString();
-        final boolean wantEnable = !cachedAccessibilityEnabled;
+    // ═══════════ START / STOP PLAYBACK ═══════════
+
+    private void togglePlayback() {
+        if (isServiceRunning) {
+            stopPlayback();
+        } else {
+            startPlayback();
+        }
+    }
+
+    private void startPlayback() {
+        // Check overlay permission
+        if (!canDrawOverlays()) {
+            showOverlayPermissionDialog();
+            return;
+        }
 
         bg.execute(() -> {
             try {
-                if (!wantEnable) {
-                    sendBroadcast(new Intent("intent.tuoluoyi.exit"));
-                    String cur = Settings.Secure.getString(getContentResolver(),
-                            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-                    if (cur != null) {
-                        List<String> list = new ArrayList<>(Arrays.asList(cur.split(":")));
-                        list.remove(svcName);
-                        Settings.Secure.putString(getContentResolver(),
-                                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-                                TextUtils.join(":", list));
-                    }
-                } else {
-                    String cur = Settings.Secure.getString(getContentResolver(),
-                            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-                    String next = (cur == null || cur.isEmpty())
-                            ? svcName : svcName + ":" + cur;
-                    Settings.Secure.putInt(getContentResolver(),
-                            Settings.Secure.ACCESSIBILITY_ENABLED, 1);
-                    Settings.Secure.putString(getContentResolver(),
-                            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, next);
-                }
+                enableAccessibilityService();
+                ui.post(() -> {
+                    isServiceRunning = true;
+                    sp.edit().remove("panel_user_dismissed").apply();
+                    startFloatingPanel();
+                    updateStartButton(healthMonitor.getLastState());
+                });
             } catch (Exception e) {
-                Log.e(TAG, "toggleAccessibility", e);
+                Log.e(TAG, "startPlayback", e);
                 ui.post(() -> BrutalPopup.toast(this,
-                        wantEnable ? "Failed to start the service."
-                                   : "Failed to stop the service.",
-                        BrutalPopup.LENGTH_SHORT));
+                        "Failed to start service.", BrutalPopup.LENGTH_SHORT));
             }
-            refreshAccessibilityCacheAsync();
         });
     }
 
-    /* ---------------- FLOATING OVERLAY ---------------- */
+    private void stopPlayback() {
+        bg.execute(() -> {
+            try {
+                disableAccessibilityService();
+                sendBroadcast(new Intent("intent.tuoluoyi.exit"));
+            } catch (Throwable t) {
+                Log.e(TAG, "stopPlayback", t);
+            }
+            ui.post(() -> {
+                isServiceRunning = false;
+                updateStartButton(healthMonitor.getLastState());
+            });
+        });
+    }
+
+    // ═══════════ FORCE CLOSE (NUCLEAR TEARDOWN) ═══════════
+
+    /**
+     * Nuclear teardown: kill EVERYTHING, clear session, exit to Login.
+     *
+     * Order:
+     *   1. Stop MIDI file player (via FloatingPanel)
+     *   2. Stop FloatingPanelService
+     *   3. Disable AccessibilityService
+     *   4. Kill daemon (closeAndExit via binder)
+     *   5. Clear session + all active flags
+     *   6. Kill own process
+     */
+    private void performNuclearTeardown() {
+        bg.execute(() -> {
+            // 1-2. Stop floating panel service
+            try {
+                stopService(new Intent(this, FloatingPanelService.class));
+            } catch (Throwable ignored) {}
+
+            // 3. Disable accessibility service
+            try {
+                disableAccessibilityService();
+            } catch (Throwable ignored) {}
+
+            // 4. Kill daemon
+            try {
+                IGamePad gp = GamePadBridge.gamePad;
+                if (gp != null) gp.closeAndExit();
+            } catch (Throwable ignored) {}
+            try {
+                sendBroadcast(new Intent("intent.tuoluoyi.exit"));
+            } catch (Throwable ignored) {}
+
+            // 5. Clear session
+            sp.edit()
+                    .putBoolean("session_active", false)
+                    .remove("panel_user_dismissed")
+                    .apply();
+            GamePadBridge.gamePad = null;
+
+            // 6. Kill process
+            ui.postDelayed(() -> {
+                finishAffinity();
+                android.os.Process.killProcess(android.os.Process.myPid());
+            }, 300);
+        });
+    }
+
+    // ═══════════ HEALTH LOST DIALOG ═══════════
+
+    private void showHealthLostDialog(PermissionHealthMonitor.HealthState state) {
+        List<String> issues = new ArrayList<>();
+        if (!state.hasPermission) issues.add("Permission revoked");
+        if (!state.hasAccessibility) issues.add("Accessibility disabled");
+        if (!state.hasDaemon) issues.add("Daemon disconnected");
+
+        BrutalPopup.dialog(this,
+                "Connection Lost",
+                "The following conditions failed:\n\n" +
+                        TextUtils.join("\n", issues) +
+                        "\n\nYou need to go through the permission gate again.",
+                "Re-authenticate",
+                () -> {
+                    startActivity(new Intent(this, PermissionGateActivity.class));
+                    finish();
+                },
+                "Force Close",
+                this::performNuclearTeardown,
+                null, null,
+                false); // not cancelable
+    }
+
+    // ═══════════ HELPER METHODS ═══════════
+
+    private void enableAccessibilityService() {
+        String svcName = new ComponentName(getPackageName(),
+                tuoluoyiService.class.getName()).flattenToString();
+        String current = Settings.Secure.getString(getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        if (current == null) current = "";
+        if (!current.contains(svcName)) {
+            String next = current.isEmpty() ? svcName : svcName + ":" + current;
+            Settings.Secure.putInt(getContentResolver(),
+                    Settings.Secure.ACCESSIBILITY_ENABLED, 1);
+            Settings.Secure.putString(getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, next);
+        }
+    }
+
+    private void disableAccessibilityService() {
+        String svcName = new ComponentName(getPackageName(),
+                tuoluoyiService.class.getName()).flattenToString();
+        String cur = Settings.Secure.getString(getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        if (cur != null && cur.contains(svcName)) {
+            List<String> list = new ArrayList<>(Arrays.asList(cur.split(":")));
+            list.remove(svcName);
+            Settings.Secure.putString(getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                    TextUtils.join(":", list));
+        }
+    }
 
     private boolean canDrawOverlays() {
         try { return Settings.canDrawOverlays(this); }
@@ -455,26 +438,22 @@ public class MainActivity extends Activity {
 
     private void showOverlayPermissionDialog() {
         BrutalPopup.dialog(this,
-                "Floating overlay permission",
-                "Papiano butuh izin tampil di atas aplikasi lain "
-                        + "supaya panel kontrol tetap muncul saat kamu pindah "
-                        + "ke Roblox / app lain.",
+                "Overlay Permission",
+                "Papiano needs permission to display over other apps so the floating panel stays visible while you play.",
                 "Open Settings",
                 () -> {
                     try {
-                        Intent intent = new Intent(
+                        startActivity(new Intent(
                                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:" + getPackageName()));
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(intent);
+                                Uri.parse("package:" + getPackageName()))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                     } catch (Throwable t) {
-                        Log.w(TAG, "open overlay settings", t);
-                        BrutalPopup.toast(this, "Buka Settings manual: "
-                                + "Apps -> Papiano -> Display over other apps",
+                        BrutalPopup.toast(this,
+                                "Open Settings manually: Apps > Papiano > Display over apps",
                                 BrutalPopup.LENGTH_LONG);
                     }
                 },
-                getString(R.string.cancel), null,
+                "Cancel", null,
                 null, null,
                 true);
     }
@@ -492,123 +471,46 @@ public class MainActivity extends Activity {
         }
     }
 
-    /* ---------------- BROADCAST CALLBACKS ---------------- */
-
-    private void onDaemonReady() {
-        BrutalPopup.toast(this, R.string.connect_success, BrutalPopup.LENGTH_SHORT);
-        refreshPermissionStatus();
-        refreshAccessibilityCacheAsync();
+    private String capitalize(String s) {
+        if (s == null || s.isEmpty()) return "Unknown";
+        return s.substring(0, 1).toUpperCase() + s.substring(1);
     }
 
-    private void onDaemonStopped() {
-        refreshAccessibilityCacheAsync();
-    }
-
-    /* ---------------- SHIZUKU / SETUP ---------------- */
-
-    /** Run on background. */
-    private void grantWriteSecureSettingsViaShizuku() {
-        try {
-            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                Process p = Shizuku.newProcess(new String[]{"sh"}, null, null);
-                OutputStream o = p.getOutputStream();
-                String cmd = "pm grant " + getPackageName()
-                        + " android.permission.WRITE_SECURE_SETTINGS\nexit\n";
-                o.write(cmd.getBytes()); o.flush(); o.close(); p.waitFor();
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) p.destroyForcibly();
-                else p.destroy();
-                Log.d(TAG, "WRITE_SECURE_SETTINGS granted via Shizuku");
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "grantWriteSecureSettingsViaShizuku", e);
-        }
-    }
-
-    /** Run on background. */
-    private void launchViaShizuku() {
-        if (!isListenerAdded) {
-            ui.post(() -> {
-                Shizuku.addRequestPermissionResultListener(SHIZUKU_LISTENER);
-                isListenerAdded = true;
-            });
-        }
-        try {
-            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                ui.post(() -> Shizuku.requestPermission(0));
-                return;
-            }
-            grantWriteSecureSettingsViaShizuku();
-            java.io.File extDir = getExternalFilesDir(null);
-            String base = extDir != null ? extDir.getPath() : getFilesDir().getPath();
-            String cmd = "sh " + base + "/starter.sh";
-            Process p = Shizuku.newProcess(new String[]{"sh"}, null, null);
-            OutputStream o = p.getOutputStream();
-            o.write((cmd + "\nexit\n").getBytes()); o.flush(); o.close(); p.waitFor();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) p.destroyForcibly();
-            else p.destroy();
-            ui.post(this::refreshPermissionStatus);
-        } catch (Exception e) {
-            Log.e(TAG, "shizuku", e);
-            ui.post(() -> BrutalPopup.toast(this, "Shizuku is not running.",
-                    BrutalPopup.LENGTH_SHORT));
-        }
-    }
-
-    /** Run on background. PowerManager.isIgnoringBatteryOptimizations() = sync binder. */
     private void requestBatteryExemption() {
         try {
-            PowerManager pm = (PowerManager) getSystemService(Service.POWER_SERVICE);
-            final boolean needsRequest = pm != null
-                    && !pm.isIgnoringBatteryOptimizations(getPackageName());
-            if (needsRequest) {
+            android.os.PowerManager pm = (android.os.PowerManager)
+                    getSystemService(POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
                 ui.post(() -> {
                     try {
-                        Intent i = new Intent(
+                        startActivity(new Intent(
                                 Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                                Uri.parse("package:" + getPackageName()));
-                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(i);
-                    } catch (Throwable e) { Log.w(TAG, "battery startActivity", e); }
+                                Uri.parse("package:" + getPackageName()))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                    } catch (Throwable ignored) {}
                 });
             }
-        } catch (Throwable e) { Log.w(TAG, "battery", e); }
+        } catch (Throwable ignored) {}
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                NotificationManager nm =
-                        (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-                final boolean needsNotifPerm = nm != null && !nm.areNotificationsEnabled();
-                if (needsNotifPerm) {
+                android.app.NotificationManager nm = (android.app.NotificationManager)
+                        getSystemService(NOTIFICATION_SERVICE);
+                if (nm != null && !nm.areNotificationsEnabled()) {
                     ui.post(() -> {
                         try {
                             requestPermissions(new String[]{
                                     "android.permission.POST_NOTIFICATIONS"}, 0);
-                        } catch (Throwable e) { Log.w(TAG, "notif perm req", e); }
+                        } catch (Throwable ignored) {}
                     });
                 }
             }
-        } catch (Throwable e) { Log.w(TAG, "notif perm", e); }
+        } catch (Throwable ignored) {}
     }
-
-    private void showWelcome() {
-        BrutalPopup.dialog(this,
-                getString(R.string.privacy_title),
-                getString(R.string.privacy_text),
-                getString(R.string.agree),
-                () -> sp.edit().putBoolean("first", false).apply(),
-                getString(R.string.exit), this::finish,
-                null, null,
-                false);
-    }
-
-    /* ---------------- ASSETS UNPACK (background only) ---------------- */
 
     private void unzipFiles() {
         java.io.File extDir = getExternalFilesDir(null);
-        if (extDir == null) {
-            Log.w(TAG, "external files dir null, skip unzip");
-            return;
-        }
+        if (extDir == null) return;
         String base = extDir.getPath();
 
         try {
@@ -646,36 +548,27 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
-    /* ---------------- LIFECYCLE ---------------- */
+    // ═══════════ LIFECYCLE ═══════════
 
     @Override
     protected void onResume() {
         super.onResume();
-        refreshPermissionStatus();
-        refreshAccessibilityCacheAsync();
-        // Kalau service udah running + overlay perm udah granted (mis. user
-        // baru pulang dari Settings), auto-start panel biar gak perlu pencet
-        // Start Playing 2x. TAPI hormati flag panel_user_dismissed: kalau
-        // user baru aja close panel pake ✕, jangan langsung restart.
-        if (cachedAccessibilityEnabled && canDrawOverlays()
-                && !sp.getBoolean("panel_user_dismissed", false)) {
-            startFloatingPanel();
-        }
+        healthMonitor.forceCheck();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        healthMonitor.destroy();
         if (isBroadcastRegistered) {
-            try { unregisterReceiver(mBroadcastReceiver); } catch (Throwable ignored) {}
-        }
-        if (isListenerAdded) {
-            try { Shizuku.removeRequestPermissionResultListener(SHIZUKU_LISTENER); }
-            catch (Throwable ignored) {}
+            try { unregisterReceiver(receiver); } catch (Throwable ignored) {}
         }
         bg.shutdownNow();
     }
 
     @Override
-    public void onBackPressed() { finish(); }
+    public void onBackPressed() {
+        // Just minimize, don't destroy session
+        moveTaskToBack(true);
+    }
 }

@@ -414,14 +414,9 @@ class FloatingPanelService : Service() {
             showBubble()
         }
         view.findViewById<View>(R.id.btn_close).setOnClickListener {
-            // Panel-only close. Set flag biar auto-launch dari accessibility
-            // service / MainActivity.onResume / dst gak nge-restart panel
-            // pas user emang gak mau liat. NOTE: TIDAK kirim
-            // intent.tuoluoyi.exit — broadcast itu matiin accessibility juga.
-            try {
-                sp.edit().putBoolean(KEY_USER_DISMISSED, true).apply()
-            } catch (_: Throwable) {}
-            stopSelf()
+            // ✕ = NUCLEAR TEARDOWN (force close everything).
+            // Kill daemon, disable accessibility, clear session, kill process.
+            performNuclearTeardown()
         }
 
         sbOpacity?.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -734,7 +729,55 @@ class FloatingPanelService : Service() {
 
 
 
-    /* ---------------- LIFECYCLE ---------------- */
+    /* ---------------- NUCLEAR TEARDOWN (Force Close) ---------------- */
+
+    /**
+     * Kill everything: daemon, accessibility, session. Full reset.
+     * After this, user must re-authenticate on next app launch.
+     */
+    private fun performNuclearTeardown() {
+        Thread {
+            // 1. Stop MIDI file player
+            try { midiFilePlayer?.stop() } catch (_: Throwable) {}
+
+            // 2. Disable accessibility service
+            try {
+                val svcName = android.content.ComponentName(packageName,
+                    tuoluoyiService::class.java.name).flattenToString()
+                val cur = android.provider.Settings.Secure.getString(
+                    contentResolver,
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                if (cur.contains(svcName)) {
+                    val list = cur.split(":").toMutableList()
+                    list.remove(svcName)
+                    android.provider.Settings.Secure.putString(contentResolver,
+                        android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                        list.joinToString(":"))
+                }
+            } catch (_: Throwable) {}
+
+            // 3. Kill daemon
+            try { GamePadBridge.gamePad?.closeAndExit() } catch (_: Throwable) {}
+            try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
+            GamePadBridge.gamePad = null
+
+            // 4. Clear session
+            try {
+                sp.edit()
+                    .putBoolean("session_active", false)
+                    .remove(KEY_USER_DISMISSED)
+                    .apply()
+            } catch (_: Throwable) {}
+
+            // 5. Stop self + kill process
+            mainHandler.postDelayed({
+                stopSelf()
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }, 200)
+        }.start()
+    }
+
+    /* ---------------- CONFIGURATION CHANGE ---------------- */
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)

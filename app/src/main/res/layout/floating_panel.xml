@@ -5,7 +5,7 @@
     android:orientation="vertical"
     android:background="@drawable/panel_bg">
 
-    <!-- HEADER (drag handle) — fixed, not scrollable -->
+    <!-- HEADER (drag handle) — fixed -->
     <LinearLayout
         android:id="@+id/panel_header"
         android:layout_width="match_parent"
@@ -13,8 +13,8 @@
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:paddingHorizontal="14dp"
-        android:paddingTop="12dp"
-        android:paddingBottom="10dp">
+        android:paddingTop="10dp"
+        android:paddingBottom="8dp">
 
         <TextView
             android:layout_width="0dp"
@@ -22,10 +22,11 @@
             android:layout_weight="1"
             android:text="PAPIANO!"
             android:textColor="@color/accent_glow"
-            android:textSize="14sp"
+            android:textSize="13sp"
             android:textStyle="bold"
             android:letterSpacing="0.05" />
 
+        <!-- Minimize (collapse to bubble) -->
         <TextView
             android:id="@+id/btn_minimize"
             android:layout_width="28dp"
@@ -33,11 +34,12 @@
             android:gravity="center"
             android:clickable="true"
             android:focusable="true"
-            android:text="−"
+            android:text="\u2212"
             android:textColor="@color/text_primary"
             android:textSize="18sp"
             android:textStyle="bold" />
 
+        <!-- Force Close (nuclear teardown) -->
         <TextView
             android:id="@+id/btn_close"
             android:layout_width="28dp"
@@ -45,7 +47,7 @@
             android:gravity="center"
             android:clickable="true"
             android:focusable="true"
-            android:text="✕"
+            android:text="\u2715"
             android:textColor="@color/red"
             android:textSize="13sp"
             android:textStyle="bold" />
@@ -59,14 +61,14 @@
         android:fillViewport="false"
         android:scrollbars="vertical"
         android:fadingEdge="vertical"
-        android:fadingEdgeLength="8dp">
+        android:fadingEdgeLength="6dp">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:paddingHorizontal="14dp"
-            android:paddingBottom="12dp">
+            android:paddingBottom="10dp">
 
             <View
                 android:layout_width="match_parent"
@@ -74,83 +76,59 @@
                 android:background="@color/brutal_black"
                 android:layout_marginBottom="8dp" />
 
-            <!-- STATUS section -->
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="STATUS"
-                android:textColor="@color/brutal_black"
-                android:textSize="9sp"
-                android:letterSpacing="0.12" />
-
+            <!-- ═══ STATUS ═══ -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:gravity="center_vertical"
-                android:layout_marginTop="3dp">
+                android:layout_marginBottom="8dp">
 
                 <TextView
                     android:id="@+id/tv_service_dot"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="●"
-                    android:textSize="12sp"
-                    android:textColor="@color/text_muted" />
+                    android:text="\u25CF"
+                    android:textSize="10sp"
+                    android:textColor="@color/green" />
 
                 <TextView
                     android:id="@+id/tv_service_status"
-                    android:layout_width="match_parent"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
+                    android:layout_weight="1"
                     android:layout_marginStart="6dp"
-                    android:text="Service Inactive"
+                    android:text="Active"
+                    android:textColor="@color/green"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <!-- MIDI device indicator -->
+                <TextView
+                    android:id="@+id/tv_midi"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Disconnected"
                     android:textColor="@color/text_muted"
-                    android:textSize="12sp" />
+                    android:textSize="10sp"
+                    android:singleLine="true" />
             </LinearLayout>
 
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
                 android:background="@color/brutal_black"
-                android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp" />
 
-            <!-- MIDI INPUT section -->
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="MIDI INPUT"
-                android:textColor="@color/brutal_black"
-                android:textSize="9sp"
-                android:letterSpacing="0.12" />
-
-            <TextView
-                android:id="@+id/tv_midi"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Disconnected"
-                android:textColor="@color/text_muted"
-                android:textSize="12sp"
-                android:textStyle="bold"
-                android:layout_marginTop="3dp"
-                android:singleLine="true"
-                android:ellipsize="end" />
-
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:background="@color/brutal_black"
-                android:layout_marginTop="8dp"
-                android:layout_marginBottom="8dp" />
-
-            <!-- ═══════════ MIDI FILE PLAYER ═══════════ -->
+            <!-- ═══ MIDI FILE PLAYER ═══ -->
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="MIDI FILE PLAYER"
                 android:textColor="@color/brutal_black"
                 android:textSize="9sp"
-                android:letterSpacing="0.12" />
+                android:letterSpacing="0.12"
+                android:layout_marginBottom="4dp" />
 
             <TextView
                 android:id="@+id/tv_midi_file_name"
@@ -161,10 +139,9 @@
                 android:textSize="11sp"
                 android:singleLine="true"
                 android:ellipsize="middle"
-                android:layout_marginTop="3dp"
                 android:layout_marginBottom="6dp" />
 
-            <!-- Player controls -->
+            <!-- Player controls row -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -174,7 +151,7 @@
                 <ImageView
                     android:id="@+id/btn_midi_load"
                     android:layout_width="0dp"
-                    android:layout_height="32dp"
+                    android:layout_height="30dp"
                     android:layout_weight="1"
                     android:scaleType="center"
                     android:clickable="true"
@@ -182,12 +159,12 @@
                     android:src="@drawable/ic_load"
                     android:background="@drawable/btn_player"
                     android:layout_marginEnd="4dp"
-                    android:contentDescription="Load MIDI" />
+                    android:contentDescription="Load" />
 
                 <ImageView
                     android:id="@+id/btn_midi_play"
                     android:layout_width="0dp"
-                    android:layout_height="32dp"
+                    android:layout_height="30dp"
                     android:layout_weight="1"
                     android:scaleType="center"
                     android:clickable="true"
@@ -200,7 +177,7 @@
                 <ImageView
                     android:id="@+id/btn_midi_stop"
                     android:layout_width="0dp"
-                    android:layout_height="32dp"
+                    android:layout_height="30dp"
                     android:layout_weight="1"
                     android:scaleType="center"
                     android:clickable="true"
@@ -210,7 +187,7 @@
                     android:contentDescription="Stop" />
             </LinearLayout>
 
-            <!-- Speed control -->
+            <!-- Speed -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -254,36 +231,21 @@
                 android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp" />
 
-            <!-- VELOCITY toggle -->
+            <!-- ═══ VELOCITY ═══ -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:gravity="center_vertical">
 
-                <LinearLayout
+                <TextView
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:orientation="vertical"
-                    android:layout_marginEnd="8dp">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="VELOCITY"
-                        android:textColor="@color/brutal_black"
-                        android:textSize="9sp"
-                        android:letterSpacing="0.12" />
-
-                    <TextView
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:text="Visual Piano dynamics"
-                        android:textColor="@color/text_muted"
-                        android:textSize="10sp"
-                        android:layout_marginTop="1dp" />
-                </LinearLayout>
+                    android:text="VELOCITY"
+                    android:textColor="@color/brutal_black"
+                    android:textSize="9sp"
+                    android:letterSpacing="0.12" />
 
                 <Switch
                     android:id="@+id/sw_velocity"
@@ -292,50 +254,6 @@
                     android:thumbTint="@color/accent_glow"
                     android:trackTint="@color/text_muted" />
             </LinearLayout>
-
-
-
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:background="@color/brutal_black"
-                android:layout_marginTop="8dp"
-                android:layout_marginBottom="8dp" />
-
-            <!-- OPACITY -->
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="OPACITY"
-                    android:textColor="@color/brutal_black"
-                    android:textSize="9sp"
-                    android:letterSpacing="0.12" />
-
-                <TextView
-                    android:id="@+id/tv_opacity_value"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="80%"
-                    android:textColor="@color/accent_glow"
-                    android:textSize="10sp" />
-            </LinearLayout>
-
-            <SeekBar
-                android:id="@+id/sb_opacity"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:max="100"
-                android:progress="80"
-                android:progressTint="@color/accent_glow"
-                android:thumbTint="@color/accent_glow"
-                android:layout_marginTop="2dp" />
 
         </LinearLayout>
     </ScrollView>
