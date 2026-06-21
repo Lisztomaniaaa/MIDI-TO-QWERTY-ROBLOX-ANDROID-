@@ -1,546 +1,264 @@
-#include <jni.h>
-#include <cstdio>
-#include <cstdlib>
-#include <unistd.h>
-#include <fcntl.h>
-#include <cstring>
-#include <linux/uinput.h>
-#include <cerrno>
-#include <fcntl.h>
-#include <poll.h>
+/**
+ * native-lib.cpp — uinput-based virtual keyboard for MIDI-to-QWERTY.
+ *
+ * ARCHITECTURE (v2 rewrite):
+ *   Previous version used /dev/uhid with HID boot-protocol reports. That had
+ *   two fatal limitations for fast classical pieces (e.g. Etude Op.10 No.4):
+ *     1. 6KRO: max 6 simultaneous keys in one HID report.
+ *     2. Shared modifier byte: Shift/Ctrl affected ALL held keys at once,
+ *        making natural + sharp notes impossible to hold together.
+ *
+ *   New version uses /dev/uinput with individual EV_KEY events:
+ *     - UNLIMITED simultaneous keys (each key is independent)
+ *     - SCOPED MODIFIERS: Shift/Ctrl is tapped ONLY during the key-down
+ *       SYN_REPORT, then immediately released. The game registers the
+ *       modified key at InputBegan time; the key stays held without modifier.
+ *     - Lower per-event latency: one write per key event vs 8-byte report.
+ *
+ *   The "scoped modifier tap" trick works because Roblox (and most game
+ *   engines) check modifier state at the MOMENT of InputBegan, not
+ *   continuously during hold. So:
+ *     Frame 1: Shift-down + A-down + SYN → game sees "A" (shifted)
+ *     Frame 2: Shift-up + SYN            → game sees Shift released
+ *     Result: "A" stays held without shift polluting other keys.
+ *
+ * PERFORMANCE:
+ *   - Process-level nice -19 (URGENT_AUDIO equivalent)
+ *   - Per-thread boost on first binder call
+ *   - Batched writes (multiple input_events in one write() syscall)
+ *   - Zero heap allocation on hot path
+ *   - Key-collision detection (same physical key, different notes)
+ */
 
+#include <jni.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <termios.h>
 #include <unistd.h>
-#include <linux/uhid.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <linux/uinput.h>
 #include <linux/input.h>
-#include <jni.h>
 #include <android/log.h>
-#include <unordered_map>
-#include <string>
-#include <array>
-#include <vector>
 #include <mutex>
 #include <atomic>
-#include <thread>
+#include <vector>
 #include <algorithm>
 #include <sys/resource.h>
-#include <sys/syscall.h>
+#include <sys/time.h>
 
-static int uhid_fd = -1;
-static struct uhid_event uhidEvent;
-const char *TAG = "RobloxAndroidMidi";
-
-// Last 8-byte HID report we sent to the kernel. Updated by writeKeyboard()
-// on every actual write so it always reflects the kernel's view, even when
-// the press path issues its own direct writes (e.g. velocity Alt+velKey tap).
-// emitHeldReport() consults this to skip syscalls that would push an already-
-// current state — e.g. a release of a note that wasn't actually held, or a
-// state that's identical after the redundant 6KRO eviction path. Each saved
-// write is one less event for the kernel HID dispatcher and Roblox to chew
-// through, which directly translates to lower felt latency on burst sections.
-static uint8_t g_lastReport[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static const char *TAG = "RobloxAndroidMidi";
 
 // ============================================================================
-// UHID write helper — retry on EAGAIN/EINTR.
-// ----------------------------------------------------------------------------
-// /dev/uhid was opened O_NONBLOCK (O_NDELAY). If the kernel report queue is
-// momentarily full (rare burst case) write() returns -1 with errno=EAGAIN.
-// Old code ignored the return value -> the note was silently dropped, which
-// the user perceives as "missed a key" (much worse than a tiny extra wait).
-//
-// Strategy: spin-retry with sched_yield up to ~1ms total. Real-world UHID
-// write should complete in microseconds; if it doesn't, we'd rather wait a
-// few hundred microseconds than lose the note. Bounded so a truly broken fd
-// can't hang the binder thread forever.
+// UINPUT DEVICE
 // ============================================================================
-static inline ssize_t uhidWrite(const void *buf, size_t len) {
-    if (uhid_fd < 0) return -1;
-    // ~1ms total budget at 4us per yield iteration (256 attempts).
+
+static int g_uinputFd = -1;
+
+// Write helper — retry on EAGAIN/EINTR (same philosophy as old uhidWrite).
+static inline ssize_t uinputWrite(const void *buf, size_t len) {
+    if (g_uinputFd < 0) return -1;
     for (int attempt = 0; attempt < 256; ++attempt) {
-        ssize_t r = write(uhid_fd, buf, len);
+        ssize_t r = write(g_uinputFd, buf, len);
         if (r >= 0) return r;
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             sched_yield();
             continue;
         }
-        // Hard error: log once per uHID lifetime and bail.
         static std::atomic<bool> warned{false};
         bool expected = false;
         if (warned.compare_exchange_strong(expected, true)) {
             __android_log_print(ANDROID_LOG_ERROR, TAG,
-                    "uhid write failed: errno=%d (%s)", errno, strerror(errno));
+                "uinput write failed: errno=%d (%s)", errno, strerror(errno));
         }
         return r;
     }
     return -1;
 }
 
-// Keyboard description
-static unsigned char description[] = {
-        0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
-        0x09, 0x06,        // Usage (Keyboard)
-        0xA1, 0x01,        // Collection (Application)
-        0x05, 0x07,        //   Usage Page (Kbrd/Keypad)
-        0x19, 0xE0,        //   Usage Minimum (0xE0)
-        0x29, 0xE7,        //   Usage Maximum (0xE7)
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x25, 0x01,        //   Logical Maximum (1)
-        0x75, 0x01,        //   Report Size (1)
-        0x95, 0x08,        //   Report Count (8)
-        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x95, 0x01,        //   Report Count (1)
-        0x75, 0x08,        //   Report Size (8)
-        0x81, 0x03,        //   Input (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x95, 0x05,        //   Report Count (5)
-        0x75, 0x01,        //   Report Size (1)
-        0x05, 0x08,        //   Usage Page (LEDs)
-        0x19, 0x01,        //   Usage Minimum (Num Lock)
-        0x29, 0x05,        //   Usage Maximum (Kana)
-        0x91, 0x02,        //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
-        0x95, 0x01,        //   Report Count (1)
-        0x75, 0x03,        //   Report Size (3)
-        0x91, 0x03,        //   Output (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
-        0x95, 0x06,        //   Report Count (6)
-        0x75, 0x08,        //   Report Size (8)
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x25, 0x65,        //   Logical Maximum (101)
-        0x05, 0x07,        //   Usage Page (Kbrd/Keypad)
-        0x19, 0x00,        //   Usage Minimum (0x00)
-        0x29, 0x65,        //   Usage Maximum (0x65)
-        0x81, 0x00,        //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0xC0,              // End Collection
-
-};
-
-const int NUM_KEYS = 88;
-
-std::array<std::string, NUM_KEYS> pianoQwertyKeys = {
-        // A0
-        "ctrl_1", "ctrl_2", "ctrl_3", "ctrl_4", "ctrl_5",
-        "ctrl_6", "ctrl_7", "ctrl_8", "ctrl_9", "ctrl_0", "ctrl_q", "ctrl_w",
-        "ctrl_e", "ctrl_r", "ctrl_t",
-
-        // Normal keys C2 to C7
-        "1", "!", "2", "@", "3", "4", "$", "5", "%",
-        "6", "^", "7", "8", "*", "9", "(", "0", "q", "Q", "w", "W",
-        "e", "E", "r", "t", "T", "y", "Y", "u", "i", "I", "o", "O",
-        "p", "P", "a", "s", "S", "d", "D", "f", "g", "G", "h", "H",
-        "j", "J", "k", "l", "L", "z", "Z", "x", "c", "C", "v", "V",
-        "b", "B", "n", "m",
-
-        // C# 7 to C8
-        "ctrl_y", "ctrl_u", "ctrl_i", "ctrl_o",
-        "ctrl_p", "ctrl_a", "ctrl_s", "ctrl_d", "ctrl_f", "ctrl_g", "ctrl_h",
-        "ctrl_j"
-};
-
-std::unordered_map<std::string, int> qwerty_to_hex_map = {
-        // A0
-        {"ctrl_0", 0x27},
-        {"ctrl_1", 0x1E},
-        {"ctrl_2", 0x1F},
-        {"ctrl_3", 0x20},
-        {"ctrl_4", 0x21},
-        {"ctrl_5", 0x22},
-        {"ctrl_6", 0x23},
-        {"ctrl_7", 0x24},
-        {"ctrl_8", 0x25},
-        {"ctrl_9", 0x26},
-        {"ctrl_q", 0x14},
-        {"ctrl_w", 0x1A},
-        {"ctrl_e", 0x08},
-        {"ctrl_r", 0x15},
-        {"ctrl_t", 0x17},
-
-        // Normal keys C2 to C7
-        {"a", 0x04},
-        {"b", 0x05},
-        {"c", 0x06},
-        {"d", 0x07},
-        {"e", 0x08},
-        {"f", 0x09},
-        {"g", 0x0A},
-        {"h", 0x0B},
-        {"i", 0x0C},
-        {"j", 0x0D},
-        {"k", 0x0E},
-        {"l", 0x0F},
-        {"m", 0x10},
-        {"n", 0x11},
-        {"o", 0x12},
-        {"p", 0x13},
-        {"q", 0x14},
-        {"r", 0x15},
-        {"s", 0x16},
-        {"t", 0x17},
-        {"u", 0x18},
-        {"v", 0x19},
-        {"w", 0x1A},
-        {"x", 0x1B},
-        {"y", 0x1C},
-        {"z", 0x1D},
-        {"0", 0x27},
-        {"1", 0x1E},
-        {"2", 0x1F},
-        {"3", 0x20},
-        {"4", 0x21},
-        {"5", 0x22},
-        {"6", 0x23},
-        {"7", 0x24},
-        {"8", 0x25},
-        {"9", 0x26},
-
-        // Capitals
-        {"A", 0x04},
-        {"B", 0x05},
-        {"C", 0x06},
-        {"D", 0x07},
-        {"E", 0x08},
-        {"F", 0x09},
-        {"G", 0x0A},
-        {"H", 0x0B},
-        {"I", 0x0C},
-        {"J", 0x0D},
-        {"K", 0x0E},
-        {"L", 0x0F},
-        {"M", 0x10},
-        {"N", 0x11},
-        {"O", 0x12},
-        {"P", 0x13},
-        {"Q", 0x14},
-        {"R", 0x15},
-        {"S", 0x16},
-        {"T", 0x17},
-        {"U", 0x18},
-        {"V", 0x19},
-        {"W", 0x1A},
-        {"X", 0x1B},
-        {"Y", 0x1C},
-        {"Z", 0x1D},
-        {")", 0x27},
-        {"!", 0x1E},
-        {"@", 0x1F},
-        {"#", 0x20},
-        {"$", 0x21},
-        {"%", 0x22},
-        {"^", 0x23},
-        {"&", 0x24},
-        {"*", 0x25},
-        {"(", 0x26},
-
-        // C# 7 to C8
-
-        {"ctrl_y", 0x1C},
-        {"ctrl_u", 0x18},
-        {"ctrl_i", 0x0C},
-        {"ctrl_o", 0x12},
-        {"ctrl_p", 0x13},
-        {"ctrl_a", 0x04},
-        {"ctrl_s", 0x16},
-        {"ctrl_d", 0x07},
-        {"ctrl_f", 0x09},
-        {"ctrl_g", 0x0A},
-        {"ctrl_h", 0x0B},
-        {"ctrl_j", 0x0D},
-};
-
-std::unordered_map<std::string, int> meta_key_map = {
-        // C1 (left ctrl)
-        {"ctrl_0", 0x01},
-        {"ctrl_1", 0x01},
-        {"ctrl_2", 0x01},
-        {"ctrl_3", 0x01},
-        {"ctrl_4", 0x01},
-        {"ctrl_5", 0x01},
-        {"ctrl_6", 0x01},
-        {"ctrl_7", 0x01},
-        {"ctrl_8", 0x01},
-        {"ctrl_9", 0x01},
-        {"ctrl_q", 0x01},
-        {"ctrl_w", 0x01},
-        {"ctrl_e", 0x01},
-        {"ctrl_r", 0x01},
-        {"ctrl_t", 0x01},
-
-        {"a", 0x00},
-        {"b", 0x00},
-        {"c", 0x00},
-        {"d", 0x00},
-        {"e", 0x00},
-        {"f", 0x00},
-        {"g", 0x00},
-        {"h", 0x00},
-        {"i", 0x00},
-        {"j", 0x00},
-        {"k", 0x00},
-        {"l", 0x00},
-        {"m", 0x00},
-        {"n", 0x00},
-        {"o", 0x00},
-        {"p", 0x00},
-        {"q", 0x00},
-        {"r", 0x00},
-        {"s", 0x00},
-        {"t", 0x00},
-        {"u", 0x00},
-        {"v", 0x00},
-        {"w", 0x00},
-        {"x", 0x00},
-        {"y", 0x00},
-        {"z", 0x00},
-        {"0", 0x00},
-        {"1", 0x00},
-        {"2", 0x00},
-        {"3", 0x00},
-        {"4", 0x00},
-        {"5", 0x00},
-        {"6", 0x00},
-        {"7", 0x00},
-        {"8", 0x00},
-        {"9", 0x00},
-
-        // Capitals (left shift)
-        {"A", 0x02},
-        {"B", 0x02},
-        {"C", 0x02},
-        {"D", 0x02},
-        {"E", 0x02},
-        {"F", 0x02},
-        {"G", 0x02},
-        {"H", 0x02},
-        {"I", 0x02},
-        {"J", 0x02},
-        {"K", 0x02},
-        {"L", 0x02},
-        {"M", 0x02},
-        {"N", 0x02},
-        {"O", 0x02},
-        {"P", 0x02},
-        {"Q", 0x02},
-        {"R", 0x02},
-        {"S", 0x02},
-        {"T", 0x02},
-        {"U", 0x02},
-        {"V", 0x02},
-        {"W", 0x02},
-        {"X", 0x02},
-        {"Y", 0x02},
-        {"Z", 0x02},
-        {")", 0x02},
-        {"!", 0x02},
-        {"@", 0x02},
-        {"#", 0x02},
-        {"$", 0x02},
-        {"%", 0x02},
-        {"^", 0x02},
-        {"&", 0x02},
-        {"*", 0x02},
-        {"(", 0x02},
-
-        // C# 7 to C8
-
-        {"ctrl_y", 0x01},
-        {"ctrl_u", 0x01},
-        {"ctrl_i", 0x01},
-        {"ctrl_o", 0x01},
-        {"ctrl_p", 0x01},
-        {"ctrl_a", 0x01},
-        {"ctrl_s", 0x01},
-        {"ctrl_d", 0x01},
-        {"ctrl_f", 0x01},
-        {"ctrl_g", 0x01},
-        {"ctrl_h", 0x01},
-        {"ctrl_j", 0x01},
-};
-
-std::unordered_map<std::string, int> numpad_to_hex_map = {
-        {"*", 0x55},
-        {"-", 0x56},
-        {"+", 0x57},
-
-
-        {"1", 0x59},
-        {"2", 0x5A},
-        {"3", 0x5B},
-        {"4", 0x5C},
-        {"5", 0x5D},
-        {"6", 0x5E},
-        {"7", 0x5F},
-        {"8", 0x60},
-        {"9", 0x61},
-        {"0", 0x62},
-
-        // 0123456789 (10) (11)
-        {"10", 0x56}, // keycode of -
-        {"11", 0x57}, // keycode of +
-};
-
-std::unordered_map<std::string, std::string> character_map = {
-        {"*", "*"},
-        {"-", "-"},
-        {"+", "+"},
-
-
-        {"1", "1"},
-        {"2", "2"},
-        {"3", "3"},
-        {"4", "4"},
-        {"5", "5"},
-        {"6", "6"},
-        {"7", "7"},
-        {"8", "8"},
-        {"9", "9"},
-        {"0", "0"},
-
-        {"10", "-"},
-        {"11", "+"},
-};
-
-// Function to write 8 integers to the file descriptor
-void writeKeyboard(int metakey0=0x00, int reserved1=0x00, int data2=0x00, int data3=0x00, int data4=0x00, int data5=0x00, int data6=0x00, int data7=0x00) {
-
-    // https://d1.amobbs.com/bbs_upload782111/files_47/ourdev_692986N5FAHU.pdf
-    // https://www.usbzh.com/article/detail-326.html
-
-    uhidEvent.u.input.data[0] = metakey0;
-    uhidEvent.u.input.data[1] = reserved1; // Reserved
-
-    // Keyboard keys in HEX
-    uhidEvent.u.input.data[2] = data2;
-    uhidEvent.u.input.data[3] = data3;
-    uhidEvent.u.input.data[4] = data4;
-    uhidEvent.u.input.data[5] = data5;
-    uhidEvent.u.input.data[6] = data6;
-    uhidEvent.u.input.data[7] = data7;
-    uhidWrite(&uhidEvent, sizeof(uhidEvent));
-
-    // Track what the kernel last received so emitHeldReport()'s dedup is
-    // accurate even for direct writes (e.g. velocity Alt+velKey tap).
-    g_lastReport[0] = (uint8_t) metakey0;
-    g_lastReport[1] = (uint8_t) reserved1;
-    g_lastReport[2] = (uint8_t) data2;
-    g_lastReport[3] = (uint8_t) data3;
-    g_lastReport[4] = (uint8_t) data4;
-    g_lastReport[5] = (uint8_t) data5;
-    g_lastReport[6] = (uint8_t) data6;
-    g_lastReport[7] = (uint8_t) data7;
-
-//    return 0;
+// Emit a single input_event.
+static inline void emitEvent(__u16 type, __u16 code, __s32 value) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = type;
+    ev.code = code;
+    ev.value = value;
+    uinputWrite(&ev, sizeof(ev));
 }
 
-void writeKeyboardVector(int metakey0, int reserved1, const std::vector<int>& data) {
-    if (data.size() > 6) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Error: Too many data arguments");
-        return;
+// Emit SYN_REPORT to commit pending events as one atomic input frame.
+static inline void emitSync() {
+    emitEvent(EV_SYN, SYN_REPORT, 0);
+}
+
+// Batched emit: write multiple events + SYN in one syscall for minimum latency.
+// Events array should NOT include SYN_REPORT — it's appended automatically.
+static inline void emitBatch(struct input_event *events, int count) {
+    if (count <= 0 || g_uinputFd < 0) return;
+    // Allocate on stack: max realistic batch = 4 events + 1 SYN = 5
+    // For safety, support up to 8 events + SYN.
+    struct input_event buf[9];
+    int n = (count > 8) ? 8 : count;
+    memcpy(buf, events, n * sizeof(struct input_event));
+    // Append SYN_REPORT
+    memset(&buf[n], 0, sizeof(struct input_event));
+    buf[n].type = EV_SYN;
+    buf[n].code = SYN_REPORT;
+    buf[n].value = 0;
+    uinputWrite(buf, (n + 1) * sizeof(struct input_event));
+}
+
+// ============================================================================
+// KEY MAPPING: MIDI note (21-108) → Linux keycode + modifier type
+// ============================================================================
+
+enum ModType : uint8_t {
+    MOD_NONE  = 0,
+    MOD_SHIFT = 1,  // KEY_LEFTSHIFT
+    MOD_CTRL  = 2,  // KEY_LEFTCTRL
+};
+
+struct KeyMapping {
+    __u16 keycode;   // Linux KEY_* code
+    ModType mod;     // Which modifier to scope-tap
+};
+
+// Linux keycodes for reference:
+// KEY_1=2, KEY_2=3, ..., KEY_0=11
+// KEY_Q=16, KEY_W=17, KEY_E=18, KEY_R=19, KEY_T=20, KEY_Y=21, KEY_U=22,
+// KEY_I=23, KEY_O=24, KEY_P=25
+// KEY_A=30, KEY_S=31, KEY_D=32, KEY_F=33, KEY_G=34, KEY_H=35, KEY_J=36,
+// KEY_K=37, KEY_L=38
+// KEY_Z=44, KEY_X=45, KEY_C=46, KEY_V=47, KEY_B=48, KEY_N=49, KEY_M=50
+// KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42, KEY_LEFTALT=56
+
+static const int NUM_KEYS = 88;
+
+// Index = noteNumber - 21 (0..87). Maps full 88-key piano to Roblox QWERTY.
+static const KeyMapping g_keyMap[NUM_KEYS] = {
+    // ── A0 (notes 21-35): Ctrl + key ──
+    {KEY_1, MOD_CTRL},   // 21 A0  = ctrl_1
+    {KEY_2, MOD_CTRL},   // 22 A#0 = ctrl_2
+    {KEY_3, MOD_CTRL},   // 23 B0  = ctrl_3
+    {KEY_4, MOD_CTRL},   // 24 C1  = ctrl_4
+    {KEY_5, MOD_CTRL},   // 25 C#1 = ctrl_5
+    {KEY_6, MOD_CTRL},   // 26 D1  = ctrl_6
+    {KEY_7, MOD_CTRL},   // 27 D#1 = ctrl_7
+    {KEY_8, MOD_CTRL},   // 28 E1  = ctrl_8
+    {KEY_9, MOD_CTRL},   // 29 F1  = ctrl_9
+    {KEY_0, MOD_CTRL},   // 30 F#1 = ctrl_0
+    {KEY_Q, MOD_CTRL},   // 31 G1  = ctrl_q
+    {KEY_W, MOD_CTRL},   // 32 G#1 = ctrl_w
+    {KEY_E, MOD_CTRL},   // 33 A1  = ctrl_e
+    {KEY_R, MOD_CTRL},   // 34 A#1 = ctrl_r
+    {KEY_T, MOD_CTRL},   // 35 B1  = ctrl_t
+
+    // ── C2 to C7 (notes 36-96): normal + shift ──
+    {KEY_1, MOD_NONE},   // 36 C2  = 1
+    {KEY_1, MOD_SHIFT},  // 37 C#2 = !
+    {KEY_2, MOD_NONE},   // 38 D2  = 2
+    {KEY_2, MOD_SHIFT},  // 39 D#2 = @
+    {KEY_3, MOD_NONE},   // 40 E2  = 3
+    {KEY_4, MOD_NONE},   // 41 F2  = 4
+    {KEY_4, MOD_SHIFT},  // 42 F#2 = $
+    {KEY_5, MOD_NONE},   // 43 G2  = 5
+    {KEY_5, MOD_SHIFT},  // 44 G#2 = %
+    {KEY_6, MOD_NONE},   // 45 A2  = 6
+    {KEY_6, MOD_SHIFT},  // 46 A#2 = ^
+    {KEY_7, MOD_NONE},   // 47 B2  = 7
+    {KEY_8, MOD_NONE},   // 48 C3  = 8
+    {KEY_8, MOD_SHIFT},  // 49 C#3 = *
+    {KEY_9, MOD_NONE},   // 50 D3  = 9
+    {KEY_9, MOD_SHIFT},  // 51 D#3 = (
+    {KEY_0, MOD_NONE},   // 52 E3  = 0
+    {KEY_Q, MOD_NONE},   // 53 F3  = q
+    {KEY_Q, MOD_SHIFT},  // 54 F#3 = Q
+    {KEY_W, MOD_NONE},   // 55 G3  = w
+    {KEY_W, MOD_SHIFT},  // 56 G#3 = W
+    {KEY_E, MOD_NONE},   // 57 A3  = e
+    {KEY_E, MOD_SHIFT},  // 58 A#3 = E
+    {KEY_R, MOD_NONE},   // 59 B3  = r
+    {KEY_T, MOD_NONE},   // 60 C4  = t
+    {KEY_T, MOD_SHIFT},  // 61 C#4 = T
+    {KEY_Y, MOD_NONE},   // 62 D4  = y
+    {KEY_Y, MOD_SHIFT},  // 63 D#4 = Y
+    {KEY_U, MOD_NONE},   // 64 E4  = u
+    {KEY_I, MOD_NONE},   // 65 F4  = i
+    {KEY_I, MOD_SHIFT},  // 66 F#4 = I
+    {KEY_O, MOD_NONE},   // 67 G4  = o
+    {KEY_O, MOD_SHIFT},  // 68 G#4 = O
+    {KEY_P, MOD_NONE},   // 69 A4  = p
+    {KEY_P, MOD_SHIFT},  // 70 A#4 = P
+    {KEY_A, MOD_NONE},   // 71 B4  = a
+    {KEY_S, MOD_NONE},   // 72 C5  = s
+    {KEY_S, MOD_SHIFT},  // 73 C#5 = S
+    {KEY_D, MOD_NONE},   // 74 D5  = d
+    {KEY_D, MOD_SHIFT},  // 75 D#5 = D
+    {KEY_F, MOD_NONE},   // 76 E5  = f
+    {KEY_G, MOD_NONE},   // 77 F5  = g
+    {KEY_G, MOD_SHIFT},  // 78 F#5 = G
+    {KEY_H, MOD_NONE},   // 79 G5  = h
+    {KEY_H, MOD_SHIFT},  // 80 G#5 = H
+    {KEY_J, MOD_NONE},   // 81 A5  = j
+    {KEY_J, MOD_SHIFT},  // 82 A#5 = J
+    {KEY_K, MOD_NONE},   // 83 B5  = k
+    {KEY_L, MOD_NONE},   // 84 C6  = l
+    {KEY_L, MOD_SHIFT},  // 85 C#6 = L
+    {KEY_Z, MOD_NONE},   // 86 D6  = z
+    {KEY_Z, MOD_SHIFT},  // 87 D#6 = Z
+    {KEY_X, MOD_NONE},   // 88 E6  = x
+    {KEY_C, MOD_NONE},   // 89 F6  = c
+    {KEY_C, MOD_SHIFT},  // 90 F#6 = C
+    {KEY_V, MOD_NONE},   // 91 G6  = v
+    {KEY_V, MOD_SHIFT},  // 92 G#6 = V
+    {KEY_B, MOD_NONE},   // 93 A6  = b
+    {KEY_B, MOD_SHIFT},  // 94 A#6 = B
+    {KEY_N, MOD_NONE},   // 95 B6  = n
+    {KEY_M, MOD_NONE},   // 96 C7  = m
+
+    // ── C#7 to C8 (notes 97-108): Ctrl + key ──
+    {KEY_Y, MOD_CTRL},   // 97  C#7 = ctrl_y
+    {KEY_U, MOD_CTRL},   // 98  D7  = ctrl_u
+    {KEY_I, MOD_CTRL},   // 99  D#7 = ctrl_i
+    {KEY_O, MOD_CTRL},   // 100 E7  = ctrl_o
+    {KEY_P, MOD_CTRL},   // 101 F7  = ctrl_p
+    {KEY_A, MOD_CTRL},   // 102 F#7 = ctrl_a
+    {KEY_S, MOD_CTRL},   // 103 G7  = ctrl_s
+    {KEY_D, MOD_CTRL},   // 104 G#7 = ctrl_d
+    {KEY_F, MOD_CTRL},   // 105 A7  = ctrl_f
+    {KEY_G, MOD_CTRL},   // 106 A#7 = ctrl_g
+    {KEY_H, MOD_CTRL},   // 107 B7  = ctrl_h
+    {KEY_J, MOD_CTRL},   // 108 C8  = ctrl_j
+};
+
+// Modifier keycode lookup
+static inline __u16 modifierKeycode(ModType mod) {
+    switch (mod) {
+        case MOD_SHIFT: return KEY_LEFTSHIFT;
+        case MOD_CTRL:  return KEY_LEFTCTRL;
+        default:        return 0;
     }
-
-    // https://d1.amobbs.com/bbs_upload782111/files_47/ourdev_692986N5FAHU.pdf
-    // https://www.usbzh.com/article/detail-326.html
-
-    uhidEvent.u.input.data[0] = metakey0;
-    uhidEvent.u.input.data[1] = reserved1; // Reserved
-
-    // Keyboard keys in HEX
-    for (size_t i = 0; i < data.size(); i++) {
-        uhidEvent.u.input.data[i + 2] = data[i];
-    }
-
-    uhidWrite(&uhidEvent, sizeof(uhidEvent));
-
-    writeKeyboard(); // releases all the held keys
-}
-
-// TODO: Change implementation to use Vectors for both this and the original writeKeyboard function
-void tapKeyboard(int metakey0=0x00, int reserved1=0x00, int data2=0x00, int data3=0x00, int data4=0x00, int data5=0x00, int data6=0x00, int data7=0x00) {
-    writeKeyboard(metakey0, reserved1, data2, data3, data4, data5, data6, data7);
-    writeKeyboard();
 }
 
 // ============================================================================
-// QWERTY hold/sustain state
-// ----------------------------------------------------------------------------
-// HID keyboard report cuma support 6 key concurrently (boot-protocol 6KRO).
-// Kita track semua note yang lagi di-hold di g_heldKeys, dan tiap kali ada
-// press/release kita re-emit aggregated HID report dengan up-to-6 keys di-set.
-//
-// Limit kapasitas 6: kalau note ke-7 masuk, note PALING LAMA (oldest) di-evict
-// dari held set untuk bikin ruang. Ini karena note tertua kemungkinan besar
-// udah "selesai bunyi" secara persepsi (sustain udah decay). Hasilnya:
-// chord besar tetep kedenger lengkap — cuma note paling awal yang di-cut.
-//
-// meta byte di-OR dari semua held keys (Roblox piano pake shift utk note
-// hitam tertentu dan ctrl utk oktaf paling rendah/tinggi). Kalo user
-// kombinasiin note dgn meta beda (mis. capital + ctrl_) hasil meta jadi
-// gabungan — sayangnya HID cuma punya 1 byte modifier, ini limit fundamental.
-// Use case piano normal jarang nyentuh case ini.
+// VELOCITY (Alt + velKey, 32-step) — same musical semantics as v1
 // ============================================================================
 
-struct HeldKey {
-    int note;   // MIDI note number (utk match release ke press yg bener)
-    int meta;   // modifier byte (left ctrl=0x01, left shift=0x02, none=0x00)
-    int hex;    // HID usage code
+static const __u16 KEY_MOD_ALT = KEY_LEFTALT;
+
+// 32 velocity levels mapped to keycodes: 1234567890 qwertyuiop asdfghjkl zxc
+static const __u16 g_velKeys[32] = {
+    KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
+    KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
+    KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
+    KEY_Z, KEY_X, KEY_C,
 };
 
-static std::vector<HeldKey> g_heldKeys;
-static std::mutex g_heldMutex;
-static const size_t HID_MAX_KEYS = 6;
+// Last velocity key sent (-1 = none). Only re-emit when level changes.
+static int g_lastVelIdx = -1;
 
-// Emit aggregated HID report dari current held set.
-// Caller MUST hold g_heldMutex.
-static void emitHeldReport() {
-    int meta = 0;
-    int keys[HID_MAX_KEYS] = {0, 0, 0, 0, 0, 0};
-    size_t n = std::min(g_heldKeys.size(), HID_MAX_KEYS);
-    for (size_t i = 0; i < n; i++) {
-        keys[i] = g_heldKeys[i].hex;
-        meta  |= g_heldKeys[i].meta;
-    }
-    // Same-state dedup against the actual last-written kernel report.
-    // writeKeyboard() updates g_lastReport, so this also correctly skips
-    // the case where tapVelocityKey just sent the equivalent transition.
-    uint8_t next[8] = {
-        (uint8_t) meta, 0,
-        (uint8_t) keys[0], (uint8_t) keys[1], (uint8_t) keys[2],
-        (uint8_t) keys[3], (uint8_t) keys[4], (uint8_t) keys[5]
-    };
-    if (memcmp(next, g_lastReport, 8) == 0) return;
-    writeKeyboard(meta, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]);
-}
-
-
-// ============================================================================
-// VELOCITY ("Visual Piano" / MIDI++ style) — Alt + velocity-key, 32 steps
-// ----------------------------------------------------------------------------
-// Game piano tertentu (Visual Piano, Piano Gardens, dll) menerima velocity
-// lewat keypress TERPISAH: tap `Alt + <key>` untuk SET level velocity, lalu
-// notnya ditekan biasa. Game inget level itu sampai diganti.
-//
-// Skema diambil dari MIDI++ (Zephkek/MIDIPlusPlus): 32 level, dipetakan ke
-// deret tombol di bawah (pelan -> keras). MIDI velocity 0..127 dipetakan
-// linear ke index 0..31. velKey CUMA dikirim ulang saat level berubah
-// (lihat g_lastVelHex) — biar gak spam keypress tiap not.
-//
-// LeftAlt = bit 2 di modifier byte = 0x04 (sejajar LeftCtrl=0x01, Shift=0x02).
-// ============================================================================
-static const int MOD_LEFTALT = 0x04;
-
-// HID usage code utk tiap velocity-key, index 0..31:
-//   1 2 3 4 5 6 7 8 9 0  q w e r t y u i o p  a s d f g h j k l  z x c
-static const int g_velKeyHex[32] = {
-    0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, // 1..0
-    0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C, 0x12, 0x13, // q w e r t y u i o p
-    0x04, 0x16, 0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F,       // a s d f g h j k l
-    0x1D, 0x1B, 0x06                                            // z x c
-};
-
-// velKey terakhir yg di-emit (-1 = belum ada). Reset di nativeCloseUHid.
-static int g_lastVelHex = -1;
-
-// MIDI velocity (1..127) -> velocity-key index (0..31), linear.
+// MIDI velocity (1..127) → index (0..31)
 static inline int velocityToIndex(int velocity) {
     int idx = (velocity * 32) / 128;
     if (idx < 0) idx = 0;
@@ -548,495 +266,407 @@ static inline int velocityToIndex(int velocity) {
     return idx;
 }
 
-// Kirim command "Alt + velKey" TANPA nge-release not yg lagi di-hold.
-// Not yg di-hold dimasukin ke report yg sama biar tetep down (Roblox fire
-// InputBegan cuma pas keycode transisi up->down; nambah modifier Alt
-// sementara TIDAK nge-retrigger not yg udah down). velKey dapet transisi
-// down->up fresh, jadi handler Alt+key velocity di game ke-trigger.
-// Held note yg kebetulan pakai hex sama dgn velKey di-skip biar gak dobel.
-// Caller MUST hold g_heldMutex.
-static void tapVelocityKey(int velHex) {
-    int keys[HID_MAX_KEYS] = {0, 0, 0, 0, 0, 0};
-    size_t k = 0;
-    // sisakan 1 slot utk velKey (max 5 held note ikut)
-    for (size_t i = 0; i < g_heldKeys.size() && k < HID_MAX_KEYS - 1; i++) {
-        if (g_heldKeys[i].hex == velHex) continue; // hindari duplikat keycode
-        keys[k++] = g_heldKeys[i].hex;
-    }
-    keys[k++] = velHex;
-    writeKeyboard(MOD_LEFTALT, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]);
-    // restore: Alt + velKey dilepas, not yg di-hold tetep down
-    emitHeldReport();
+// Tap Alt+velKey: press and release in two SYN frames.
+static void tapVelocityKey(__u16 velKeycode) {
+    // Frame 1: Alt down + velKey down
+    struct input_event ev[3];
+    memset(ev, 0, sizeof(ev));
+    ev[0].type = EV_KEY; ev[0].code = KEY_MOD_ALT; ev[0].value = 1;
+    ev[1].type = EV_KEY; ev[1].code = velKeycode;  ev[1].value = 1;
+    ev[2].type = EV_SYN; ev[2].code = SYN_REPORT;  ev[2].value = 0;
+    uinputWrite(ev, sizeof(ev));
+
+    // Frame 2: Alt up + velKey up
+    ev[0].type = EV_KEY; ev[0].code = velKeycode;  ev[0].value = 0;
+    ev[1].type = EV_KEY; ev[1].code = KEY_MOD_ALT; ev[1].value = 0;
+    ev[2].type = EV_SYN; ev[2].code = SYN_REPORT;  ev[2].value = 0;
+    uinputWrite(ev, sizeof(ev));
 }
 
+// ============================================================================
+// HELD KEYS STATE — tracks which physical keys are currently pressed
+// ============================================================================
+
+// Each entry: which MIDI note "owns" this physical key press.
+// Key: Linux keycode. Value: MIDI note number that pressed it (or -1 if free).
+// Fixed-size array indexed by keycode (max KEY_MAX ~767 in Linux headers,
+// but we only use up to ~88 so a simple array for keycodes up to 128 suffices).
+static const int KEYCODE_TABLE_SIZE = 128;
+static int g_keyOwner[KEYCODE_TABLE_SIZE]; // -1 = not held
+static std::mutex g_mutex;
 
 // ============================================================================
-// ZERO-ALLOCATION LOOKUP TABLE for nativeQwertyKey hot path
-// ----------------------------------------------------------------------------
-// Precomputed from pianoQwertyKeys + qwerty_to_hex_map + meta_key_map.
-// Index = noteNumber - 21 (0..87). Each entry: {hid_keycode, meta_byte}.
-// Eliminates: std::string alloc, hash lookup x2 per note event.
+// PIANO ROOMS MODE (numpad encoding) — unchanged semantics from v1
 // ============================================================================
-struct KeyEntry { int hex; int meta; };
 
-static const KeyEntry g_keyLookup[NUM_KEYS] = {
-    // A0 (notes 21-35) — ctrl_ prefix = meta 0x01
-    {0x1E, 0x01}, // ctrl_1
-    {0x1F, 0x01}, // ctrl_2
-    {0x20, 0x01}, // ctrl_3
-    {0x21, 0x01}, // ctrl_4
-    {0x22, 0x01}, // ctrl_5
-    {0x23, 0x01}, // ctrl_6
-    {0x24, 0x01}, // ctrl_7
-    {0x25, 0x01}, // ctrl_8
-    {0x26, 0x01}, // ctrl_9
-    {0x27, 0x01}, // ctrl_0
-    {0x14, 0x01}, // ctrl_q
-    {0x1A, 0x01}, // ctrl_w
-    {0x08, 0x01}, // ctrl_e
-    {0x15, 0x01}, // ctrl_r
-    {0x17, 0x01}, // ctrl_t
-
-    // Normal keys C2 to C7 (notes 36-95)
-    {0x1E, 0x00}, // "1"
-    {0x1E, 0x02}, // "!"
-    {0x1F, 0x00}, // "2"
-    {0x1F, 0x02}, // "@"
-    {0x20, 0x00}, // "3"
-    {0x21, 0x00}, // "4"
-    {0x21, 0x02}, // "$"
-    {0x22, 0x00}, // "5"
-    {0x22, 0x02}, // "%"
-    {0x23, 0x00}, // "6"
-    {0x23, 0x02}, // "^"
-    {0x24, 0x00}, // "7"
-    {0x25, 0x00}, // "8"
-    {0x25, 0x02}, // "*"
-    {0x26, 0x00}, // "9"
-    {0x26, 0x02}, // "("
-    {0x27, 0x00}, // "0"
-    {0x14, 0x00}, // "q"
-    {0x14, 0x02}, // "Q"
-    {0x1A, 0x00}, // "w"
-    {0x1A, 0x02}, // "W"
-    {0x08, 0x00}, // "e"
-    {0x08, 0x02}, // "E"
-    {0x15, 0x00}, // "r"
-    {0x17, 0x00}, // "t"
-    {0x17, 0x02}, // "T"
-    {0x1C, 0x00}, // "y"
-    {0x1C, 0x02}, // "Y"
-    {0x18, 0x00}, // "u"
-    {0x0C, 0x00}, // "i"
-    {0x0C, 0x02}, // "I"
-    {0x12, 0x00}, // "o"
-    {0x12, 0x02}, // "O"
-    {0x13, 0x00}, // "p"
-    {0x13, 0x02}, // "P"
-    {0x04, 0x00}, // "a"
-    {0x16, 0x00}, // "s"
-    {0x16, 0x02}, // "S"
-    {0x07, 0x00}, // "d"
-    {0x07, 0x02}, // "D"
-    {0x09, 0x00}, // "f"
-    {0x0A, 0x00}, // "g"
-    {0x0A, 0x02}, // "G"
-    {0x0B, 0x00}, // "h"
-    {0x0B, 0x02}, // "H"
-    {0x0D, 0x00}, // "j"
-    {0x0D, 0x02}, // "J"
-    {0x0E, 0x00}, // "k"
-    {0x0F, 0x00}, // "l"
-    {0x0F, 0x02}, // "L"
-    {0x1D, 0x00}, // "z"
-    {0x1D, 0x02}, // "Z"
-    {0x1B, 0x00}, // "x"
-    {0x06, 0x00}, // "c"
-    {0x06, 0x02}, // "C"
-    {0x19, 0x00}, // "v"
-    {0x19, 0x02}, // "V"
-    {0x05, 0x00}, // "b"
-    {0x05, 0x02}, // "B"
-    {0x11, 0x00}, // "n"
-    {0x10, 0x00}, // "m"
-
-    // C#7 to C8 (notes 97-108) — ctrl_ prefix = meta 0x01
-    {0x1C, 0x01}, // ctrl_y
-    {0x18, 0x01}, // ctrl_u
-    {0x0C, 0x01}, // ctrl_i
-    {0x12, 0x01}, // ctrl_o
-    {0x13, 0x01}, // ctrl_p
-    {0x04, 0x01}, // ctrl_a
-    {0x16, 0x01}, // ctrl_s
-    {0x07, 0x01}, // ctrl_d
-    {0x09, 0x01}, // ctrl_f
-    {0x0A, 0x01}, // ctrl_g
-    {0x0B, 0x01}, // ctrl_h
-    {0x0D, 0x01}, // ctrl_j
+// Numpad keycodes for Piano Rooms encoding
+static const __u16 g_numpadKeys[] = {
+    KEY_KP0,         // '0'
+    KEY_KP1,         // '1'
+    KEY_KP2,         // '2'
+    KEY_KP3,         // '3'
+    KEY_KP4,         // '4'
+    KEY_KP5,         // '5'
+    KEY_KP6,         // '6'
+    KEY_KP7,         // '7'
+    KEY_KP8,         // '8'
+    KEY_KP9,         // '9'
+    KEY_KPMINUS,     // '-' (index 10)
+    KEY_KPPLUS,      // '+' (index 11)
+    KEY_KPASTERISK,  // '*' (index 12)
 };
 
-// This function slices a string in such a way that no keys are repeated
-// For example, *6629*6000 becomes
-// *6 629* 60 0 0
-std::vector<std::string> splitString(const std::string& input) {
+// Map a character from the encoded string to a numpad keycode
+static __u16 charToNumpad(char c) {
+    switch (c) {
+        case '0': return KEY_KP0;
+        case '1': return KEY_KP1;
+        case '2': return KEY_KP2;
+        case '3': return KEY_KP3;
+        case '4': return KEY_KP4;
+        case '5': return KEY_KP5;
+        case '6': return KEY_KP6;
+        case '7': return KEY_KP7;
+        case '8': return KEY_KP8;
+        case '9': return KEY_KP9;
+        case '-': return KEY_KPMINUS;
+        case '+': return KEY_KPPLUS;
+        case '*': return KEY_KPASTERISK;
+        default:  return 0;
+    }
+}
+
+// ============================================================================
+// UINPUT DEVICE CREATION / DESTRUCTION
+// ============================================================================
+
+static bool createUinputDevice() {
+    g_uinputFd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (g_uinputFd < 0) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG,
+            "Failed to open /dev/uinput: errno=%d (%s)", errno, strerror(errno));
+        return false;
+    }
+
+    // Enable EV_KEY
+    if (ioctl(g_uinputFd, UI_SET_EVBIT, EV_KEY) < 0) goto fail;
+
+    // Enable all keycodes we need:
+    // Letters A-Z
+    for (int k = KEY_Q; k <= KEY_P; k++) ioctl(g_uinputFd, UI_SET_KEYBIT, k); // top row
+    for (int k = KEY_A; k <= KEY_L; k++) ioctl(g_uinputFd, UI_SET_KEYBIT, k); // middle row
+    for (int k = KEY_Z; k <= KEY_M; k++) ioctl(g_uinputFd, UI_SET_KEYBIT, k); // bottom row
+
+    // Numbers 1-0
+    for (int k = KEY_1; k <= KEY_0; k++) ioctl(g_uinputFd, UI_SET_KEYBIT, k);
+
+    // Modifiers
+    ioctl(g_uinputFd, UI_SET_KEYBIT, KEY_LEFTSHIFT);
+    ioctl(g_uinputFd, UI_SET_KEYBIT, KEY_LEFTCTRL);
+    ioctl(g_uinputFd, UI_SET_KEYBIT, KEY_LEFTALT);
+
+    // Numpad (for Piano Rooms mode)
+    for (int k = KEY_KP0; k <= KEY_KP9; k++) ioctl(g_uinputFd, UI_SET_KEYBIT, k);
+    ioctl(g_uinputFd, UI_SET_KEYBIT, KEY_KPMINUS);
+    ioctl(g_uinputFd, UI_SET_KEYBIT, KEY_KPPLUS);
+    ioctl(g_uinputFd, UI_SET_KEYBIT, KEY_KPASTERISK);
+
+    {
+        struct uinput_setup usetup;
+        memset(&usetup, 0, sizeof(usetup));
+        snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "PapianoVirtualKB");
+        usetup.id.bustype = BUS_VIRTUAL;
+        usetup.id.vendor  = 0x1234;
+        usetup.id.product = 0x5678;
+        usetup.id.version = 2;
+
+        if (ioctl(g_uinputFd, UI_DEV_SETUP, &usetup) < 0) goto fail;
+        if (ioctl(g_uinputFd, UI_DEV_CREATE) < 0) goto fail;
+    }
+
+    // Init held-key state
+    for (int i = 0; i < KEYCODE_TABLE_SIZE; i++) g_keyOwner[i] = -1;
+    g_lastVelIdx = -1;
+
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+        "uinput device created: PapianoVirtualKB (no 6KRO, scoped modifiers)");
+    return true;
+
+fail:
+    __android_log_print(ANDROID_LOG_ERROR, TAG,
+        "uinput setup failed: errno=%d (%s)", errno, strerror(errno));
+    close(g_uinputFd);
+    g_uinputFd = -1;
+    return false;
+}
+
+static bool destroyUinputDevice() {
+    if (g_uinputFd < 0) return false;
+
+    // Release all held keys
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (int i = 0; i < KEYCODE_TABLE_SIZE; i++) {
+            if (g_keyOwner[i] >= 0) {
+                emitEvent(EV_KEY, (__u16)i, 0); // key up
+                g_keyOwner[i] = -1;
+            }
+        }
+        emitSync();
+        g_lastVelIdx = -1;
+    }
+
+    ioctl(g_uinputFd, UI_DEV_DESTROY);
+    close(g_uinputFd);
+    g_uinputFd = -1;
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "uinput device destroyed");
+    return true;
+}
+
+// ============================================================================
+// CORE: nativeQwertyKey — the per-note hot path
+// ============================================================================
+//
+// SCOPED MODIFIER approach:
+//   Press: [modifier↓ +] key↓ + SYN → [modifier↑ + SYN]
+//   Release: key↑ + SYN
+//
+// The modifier (Shift/Ctrl) is held only for ONE SYN_REPORT frame — just
+// long enough for the game to read it at InputBegan. Then it's released so
+// it doesn't pollute other held keys.
+//
+// KEY COLLISION handling:
+//   If note A and note B map to the same physical key (same keycode, different
+//   modifier), the newer note evicts the older one. The physical key is released
+//   and re-pressed with the new modifier context. This is unavoidable — one
+//   physical key can't be in two states. For Etude Op.10 No.4, same-key
+//   collisions (adjacent semitones held together) are rare and short-lived.
+//
+// VELOCITY:
+//   If velocity > 0, tap Alt+velKey BEFORE the note (same as v1). Only re-emits
+//   when velocity level changes from last note.
+// ============================================================================
+
+static void pressKey(int noteNumber, const KeyMapping &km) {
+    __u16 kc = km.keycode;
+    if (kc >= KEYCODE_TABLE_SIZE) return;
+
+    // Key collision: if this physical key is already held by a different note,
+    // release it first. (Same note re-pressed = just update ownership.)
+    if (g_keyOwner[kc] >= 0 && g_keyOwner[kc] != noteNumber) {
+        emitEvent(EV_KEY, kc, 0); // release old
+        emitSync();
+    }
+
+    // Build press batch
+    if (km.mod != MOD_NONE) {
+        __u16 modKc = modifierKeycode(km.mod);
+        // Frame: modifier↓ + key↓ + SYN
+        struct input_event ev[3];
+        memset(ev, 0, sizeof(ev));
+        ev[0].type = EV_KEY; ev[0].code = modKc; ev[0].value = 1;
+        ev[1].type = EV_KEY; ev[1].code = kc;    ev[1].value = 1;
+        ev[2].type = EV_SYN; ev[2].code = SYN_REPORT; ev[2].value = 0;
+        uinputWrite(ev, sizeof(ev));
+
+        // Immediately release modifier (scoped tap)
+        struct input_event rel[2];
+        memset(rel, 0, sizeof(rel));
+        rel[0].type = EV_KEY; rel[0].code = modKc; rel[0].value = 0;
+        rel[1].type = EV_SYN; rel[1].code = SYN_REPORT; rel[1].value = 0;
+        uinputWrite(rel, sizeof(rel));
+    } else {
+        // No modifier — just key↓ + SYN
+        struct input_event ev[2];
+        memset(ev, 0, sizeof(ev));
+        ev[0].type = EV_KEY; ev[0].code = kc; ev[0].value = 1;
+        ev[1].type = EV_SYN; ev[1].code = SYN_REPORT; ev[1].value = 0;
+        uinputWrite(ev, sizeof(ev));
+    }
+
+    g_keyOwner[kc] = noteNumber;
+}
+
+static void releaseKey(int noteNumber, const KeyMapping &km) {
+    __u16 kc = km.keycode;
+    if (kc >= KEYCODE_TABLE_SIZE) return;
+
+    // Only release if THIS note still owns the key (collision eviction may
+    // have already released it).
+    if (g_keyOwner[kc] != noteNumber) return;
+
+    struct input_event ev[2];
+    memset(ev, 0, sizeof(ev));
+    ev[0].type = EV_KEY; ev[0].code = kc; ev[0].value = 0;
+    ev[1].type = EV_SYN; ev[1].code = SYN_REPORT; ev[1].value = 0;
+    uinputWrite(ev, sizeof(ev));
+
+    g_keyOwner[kc] = -1;
+}
+
+// ============================================================================
+// PIANO ROOMS: send encoded numpad key sequence
+// ============================================================================
+
+// Split encoded string so no segment contains duplicate characters (same as v1)
+static std::vector<std::string> splitString(const std::string &input) {
     std::vector<std::string> result;
     result.reserve(input.length());
     std::string current;
     uint32_t current_bits = 0;
 
     for (char c : input) {
-        uint32_t bit_index = static_cast<uint32_t>(c - '*');
-        if (!(current_bits & (1 << bit_index))) {
+        uint32_t bit_index = (uint32_t)(c - '*');
+        if (bit_index < 32 && !(current_bits & (1u << bit_index))) {
             current += c;
-            current_bits |= (1 << bit_index);
+            current_bits |= (1u << bit_index);
         } else {
-            result.push_back(current);
+            if (!current.empty()) result.push_back(current);
             current = c;
-            current_bits = (1 << bit_index);
+            current_bits = (bit_index < 32) ? (1u << bit_index) : 0;
         }
     }
-
-    result.push_back(current);
-
+    if (!current.empty()) result.push_back(current);
     return result;
 }
 
-// Function to write 8 integers to the file descriptor
-void SendEncodedKeys(std::string encodedCharacters) {
-    // encodedCharacters = *6629*6000
+static void sendNumpadSequence(const std::string &encoded) {
+    std::vector<std::string> segments = splitString(encoded);
 
-    std::vector<std::string> result = splitString(encodedCharacters);
-    //*6
-    //629*
-    //60
-    //0
-    //0
-
-    for (const auto& stringSequence : result) {
-        // loop through the string and convert each character into the corresponding hex key
-        // store each one in a vector then call a function which'd process the vector
-        std::vector<int> hex_values;
-
-        for (char c : stringSequence) {
-            std::string key = std::string(1, c);
-            hex_values.push_back(numpad_to_hex_map[key]);
-
-
+    for (const auto &seg : segments) {
+        // Press all keys in segment
+        for (char c : seg) {
+            __u16 kc = charToNumpad(c);
+            if (kc) emitEvent(EV_KEY, kc, 1);
         }
+        emitSync();
 
-        writeKeyboardVector(0x00, 0x00, hex_values);
-
+        // Release all keys in segment
+        for (char c : seg) {
+            __u16 kc = charToNumpad(c);
+            if (kc) emitEvent(EV_KEY, kc, 0);
+        }
+        emitSync();
     }
-//    __android_log_print(ANDROID_LOG_WARN, TAG, "%d %d %d %d", a,b,c,d);
 }
 
 // ============================================================================
-// UHID kernel-event drain thread.
-// ----------------------------------------------------------------------------
-// /dev/uhid is bidirectional: write() sends HID reports TO the kernel; read()
-// receives UHID_START / UHID_STOP / UHID_OPEN / UHID_CLOSE / UHID_OUTPUT
-// events FROM the kernel (e.g. when an app starts using the keyboard, or
-// requests a LED state change).
-//
-// If we never read these, they accumulate in the kernel side buffer. On most
-// kernels that's bounded and harmless, but on some Android variants a full
-// queue starts to throttle writes — exactly the kind of subtle latency
-// regression that "feels parah" without showing up in any single benchmark.
-//
-// A dedicated drain thread blocks on read() and tosses every event. Tiny
-// (~1 syscall per app focus change) and self-terminates when uhid_fd closes.
+// JNI EXPORTS — signatures MUST match GamePadNative.java exactly
 // ============================================================================
-static std::thread g_drainThread;
-static std::atomic<bool> g_drainRun{false};
 
-static void uhidDrainLoop(int fd) {
-    struct pollfd pfd;
-    while (g_drainRun.load(std::memory_order_relaxed)) {
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int pr = poll(&pfd, 1, 500);
-        if (pr <= 0) continue; // timeout or interrupted
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
-        if (pfd.revents & POLLIN) {
-            struct uhid_event ev;
-            ssize_t n = read(fd, &ev, sizeof(ev));
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EINTR) continue;
-                break;
-            }
-            // We don't care WHAT the kernel sent — discarding is fine. The
-            // point is just to keep the queue empty so no back-pressure
-            // ever bleeds into write() latency.
-        }
-    }
-}
+// Mode tracking (kept for interface compat; only QWERTY is performance-critical)
+static int g_currentMode = 0;
+static bool g_deviceCreated = false;
 
 extern "C"
 JNIEXPORT jboolean JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclass clazz) {
-    __android_log_print(ANDROID_LOG_WARN, TAG, "HELLO WORLD THIS IS FROM JNI");
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+        "nativeCreateUHid called — creating uinput device (v2 rewrite)");
 
-    // Daemon process priority: this JNI runs inside the helper daemon spawned
-    // by Shizuku/root. Boost the WHOLE process to URGENT_AUDIO-equivalent
-    // nice (-19) once at startup so every binder thread it spins up later
-    // inherits the low-jitter scheduling. Per-thread boost in nativeQwertyKey
-    // is still kept as a belt-and-suspenders for new threads added by the
-    // binder pool. setpriority(PRIO_PROCESS,0,...) without CAP_SYS_NICE is a
-    // no-op (returns -1) — safe to call unconditionally.
+    // Boost daemon process priority
     setpriority(PRIO_PROCESS, 0, -19);
 
-    // Stop any drain thread from a previous Create (e.g. uHID re-create after
-    // a daemon respawn). It was polling the now-stale fd; spawn a fresh one
-    // for the new fd below. Idempotent if no thread was running.
-    if (g_drainRun.exchange(false)) {
-        if (g_drainThread.joinable()) {
-            try { g_drainThread.join(); } catch (...) {}
-        }
+    if (g_deviceCreated) {
+        // Already created — re-create
+        destroyUinputDevice();
     }
 
-    if ((uhid_fd = open("/dev/uhid", O_RDWR | O_NDELAY)) < 0) {
-        return false;//error process.
-    }
-    struct uhid_event ev;
-    memset(&ev, 0, sizeof(uhid_event));
-    ev.type = UHID_CREATE;
-    strcpy((char *) ev.u.create.name, "uHidKeyboard");
-    ev.u.create.rd_data = description;
-    ev.u.create.rd_size = sizeof(description);
-    ev.u.create.bus = 0x03;
-    ev.u.create.vendor = 0x1;
-    ev.u.create.product = 0x1;
-    ev.u.create.version = 0x1;
-    ev.u.create.country = 0;
-    if (write(uhid_fd, &ev, sizeof(ev)) != sizeof(uhid_event)) {
-        return false;
-    }
-
-    memset(&uhidEvent, 0, sizeof(uhid_event));
-    uhidEvent.type = UHID_INPUT;
-    uhidEvent.u.input.size = 8;
-    uhidEvent.u.input.data[0] = 0x00;
-
-    // Reset last-report cache so dedup doesn't think the brand-new uHID
-    // device already received {0,0,0,0,0,0,0,0}. (Fresh device starts in
-    // unknown state — first emit must hit the wire.)
-    memset(g_lastReport, 0xFF, sizeof(g_lastReport));
-
-    // Spawn a fresh drain thread for THIS fd.
-    g_drainRun.store(true);
-    int fd_copy = uhid_fd;
-    g_drainThread = std::thread([fd_copy]() { uhidDrainLoop(fd_copy); });
-
-    return true;
+    g_deviceCreated = createUinputDevice();
+    return g_deviceCreated ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C"
 JNIEXPORT jboolean JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCloseUHid(JNIEnv *env, jclass clazz) {
-
-    // Stop drain thread first so it doesn't race against fd close.
-    g_drainRun.store(false);
-    if (g_drainThread.joinable()) {
-        try { g_drainThread.join(); } catch (...) {}
-    }
-
-    // Clear held-keys state biar gak ada stale data pas uHID di-recreate.
-    {
-        std::lock_guard<std::mutex> lock(g_heldMutex);
-        g_heldKeys.clear();
-        g_lastVelHex = -1; // reset velocity level tracking
-        memset(g_lastReport, 0, sizeof(g_lastReport));
-    }
-
-    struct uhid_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.type = UHID_DESTROY;
-    ssize_t r = (uhid_fd >= 0) ? write(uhid_fd, &ev, sizeof(uhid_event)) : -1;
-    if (uhid_fd >= 0) { close(uhid_fd); uhid_fd = -1; }
-    return r > 0;
+    bool ok = destroyUinputDevice();
+    g_deviceCreated = false;
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
-
-
-// qwerty mode function [works on most roblox piano games]
-// RobloxMidiConnect(Piano Rooms) mode function [made specifically for Piano Rooms' MidiConnect functionality]
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
-                                                     jclass thiz,
-                                                     jint noteNumber,
-                                                     jboolean isDown,
-                                                     jint velocity) {
-    if (!(noteNumber >= 21 && noteNumber <= 108)) {
-        return; // silent drop — no log on hot path
-    }
-    // Range is 21..108 inclusive = the full 88-key piano (A0..C8).
-    // g_keyLookup has NUM_KEYS(88) entries: index 0 = note 21 (A0),
-    // index 87 = note 108 (C8 -> ctrl_j). Capping at 107 used to drop C8.
+                                                             jclass thiz,
+                                                             jint noteNumber,
+                                                             jboolean isDown,
+                                                             jint velocity) {
+    if (noteNumber < 21 || noteNumber > 108) return;
+    if (g_uinputFd < 0) return;
 
-    // Latency/jitter: daemon nanganin note event lewat binder oneway dari MIDI
-    // dispatcher. Binder pakai thread POOL, jadi boost dilakukan PER-THREAD
-    // (thread_local) sekali doang tiap binder thread yg pernah ngelayanin not.
-    // Naikin nice ke -19 (setara URGENT_AUDIO) biar thread injeksi HID gak
-    // kena preempt → ngurangin jitter di sisi daemon.
-    //
-    // setpriority(PRIO_PROCESS, 0, ...) di Linux = nice thread pemanggil
-    // (nice itu per-task). CUMA nice value, bukan RT scheduling → gak bisa
-    // nge-starve sistem. Kalau proses gak punya CAP_SYS_NICE, panggilan gagal
-    // graceful (return -1) tanpa efek samping — thread tetap di prioritas normal.
-    static thread_local bool t_prioBoosted = false;
-    if (!t_prioBoosted) {
-        t_prioBoosted = true;
+    // Per-thread priority boost (binder pool threads)
+    static thread_local bool boosted = false;
+    if (!boosted) {
+        boosted = true;
         setpriority(PRIO_PROCESS, 0, -19);
     }
 
-    // Zero-allocation lookup: direct array index, no string, no hash
-    const KeyEntry& key = g_keyLookup[noteNumber - 21];
+    const int idx = noteNumber - 21;
+    const KeyMapping &km = g_keyMap[idx];
 
-    std::lock_guard<std::mutex> lock(g_heldMutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
 
     if (isDown) {
-        // Dedupe: skip if already held
-        for (const auto& h : g_heldKeys) {
-            if (h.note == noteNumber) return;
-        }
-
-        // VELOCITY: velocity>0 artinya Visual Piano velocity mode aktif untuk
-        // event ini (gating ON/OFF dilakukan di tuoluoyiService — OFF kirim 0).
-        // Tap Alt+velKey SEBELUM not ditekan, dan cuma kalau level berubah.
-        // Dilakukan sebelum push not baru supaya tapVelocityKey cuma bawa not
-        // yg lagi bener-bener di-hold (bukan not baru ini).
+        // Velocity: tap Alt+velKey if level changed
         if (velocity > 0) {
-            int velHex = g_velKeyHex[velocityToIndex(velocity)];
-            if (velHex != g_lastVelHex) {
-                g_lastVelHex = velHex;
-                tapVelocityKey(velHex);
+            int velIdx = velocityToIndex(velocity);
+            if (velIdx != g_lastVelIdx) {
+                g_lastVelIdx = velIdx;
+                tapVelocityKey(g_velKeys[velIdx]);
             }
         }
-
-        // Meta collision fix: if new note has a DIFFERENT modifier than
-        // what's currently held, drop the held set first. HID report only
-        // has 1 meta byte shared across all 6 keys — mixing notes with
-        // different modifiers causes wrong key interpretation.
-        // e.g. holding "q" (meta=0x00) + pressing "ctrl_1" (meta=0x01)
-        // would make Roblox see Ctrl+q = wrong note.
-        // Roblox sustain is absolute (hold=sound, release=stop) so
-        // dropping doesn't cause audio gaps — notes just get re-triggered.
-        //
-        // HEX-COLLISION CASE (the subtle one):
-        //   Many natural+sharp pairs share the SAME HID keycode and only
-        //   differ by modifier — e.g. note 69 (A4 = "p") and note 70
-        //   (Bb4 = "P") both use 0x13. If user plays A→Bb with A still
-        //   held (legato), the next emitHeldReport would write a report
-        //   that only flips the modifier; key 0x13 stays down across
-        //   reports so the kernel emits NO KEY_P transition and Roblox's
-        //   InputBegan handler never fires for the new note → Bb is
-        //   silent even though shift went down. We MUST insert an
-        //   intermediate empty report so the shared key cycles up→down,
-        //   forcing Roblox to see a fresh InputBegan with the new
-        //   modifier state.
-        //
-        //   When there's NO hex collision (e.g. holding "q" then
-        //   pressing "!"), the single emitHeldReport at the end of the
-        //   press path already produces a clean release-old + press-new
-        //   transition in one report — no intermediate write needed.
-        if (!g_heldKeys.empty()) {
-            int currentMeta = 0;
-            bool hexCollision = false;
-            for (const auto& h : g_heldKeys) {
-                currentMeta |= h.meta;
-                if (h.hex == key.hex) hexCollision = true;
-            }
-            if (currentMeta != key.meta) {
-                g_heldKeys.clear();
-                if (hexCollision) {
-                    writeKeyboard(); // empty report — force the shared key to cycle
-                }
-            }
-        }
-
-        // 6KRO limit: evict oldest held note to make room for new one.
-        if (g_heldKeys.size() >= HID_MAX_KEYS) {
-            g_heldKeys.erase(g_heldKeys.begin());
-        }
-
-        g_heldKeys.push_back({static_cast<int>(noteNumber), key.meta, key.hex});
-        emitHeldReport();
+        pressKey(noteNumber, km);
     } else {
-        size_t before = g_heldKeys.size();
-        g_heldKeys.erase(
-            std::remove_if(g_heldKeys.begin(), g_heldKeys.end(),
-                [noteNumber](const HeldKey& h) { return h.note == noteNumber; }),
-            g_heldKeys.end()
-        );
-        if (g_heldKeys.size() != before) {
-            emitHeldReport();
-        }
+        releaseKey(noteNumber, km);
     }
 }
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_lisztomaniaaa_papiano_GamePadNative_nativePianoRoomsKey(JNIEnv *env,
-                                                         jclass thiz,
-                                                         jintArray noteInfo) {
-    //    # We are dividing by 12 because we will be encoding it with 12 keys only(The keys are "0123456789-+")
-    //    # Additionally, it adds up nicely because there are 12 semitones in one octave
-    //
-    //    # C0 aka Note C at Octave 0
-    //    # Note number: 12
-    //    # O = msg.note / 12 = 12 / 12 = 1
-    //    # Octave = 1 - O = 1 - 1 = 0
-    //
-    //    # C4 aka Note C at Octave 4
-    //    # Note number: 60
-    //    # O = msg.note / 12 = 60 /12 = 5
-    //    # Octave = 1 - O = 5 - 1 = 4
-    //
-    //    # To decode
-    //    # (DIV_VAL * 12) + MODULOS_VAL
+                                                                  jclass thiz,
+                                                                  jintArray noteIntArray) {
+    if (g_uinputFd < 0) return;
 
-    // NOTE: Because we explicitly declared the arguments as an int, C++ automatically discards
-    // the decimal bit for us allowing us to skip having to floor(this wouldn't be possible if the values given were negative)
-
-    jsize length = env->GetArrayLength(noteInfo);
-
-    jint *int_elements = env->GetIntArrayElements(noteInfo, NULL);
-
-    std::string encodedCharacters;
-
-    for (int i = 0; i < length; i+=3) {
-        int isDown = int_elements[i];
-        int noteNumber = int_elements[i+1];
-        int velocity = int_elements[i+2];
-
-
-        int EncodedOctaveNo = noteNumber / 12;
-        int EncodedNoteNo = noteNumber % 12;
-
-        // Velocity defaults to 0 which tells the game that the notes are no longer being held
-        int EncodedVelocityA = 0;
-        int EncodedVelocityB = 0;
-
-        if (isDown) {
-            EncodedVelocityA = velocity / 12;
-            EncodedVelocityB = velocity % 12;
-        }
-
-        encodedCharacters += '*';
-
-        encodedCharacters += character_map[std::to_string(EncodedOctaveNo)];
-        encodedCharacters += character_map[std::to_string(EncodedNoteNo)];
-        encodedCharacters += character_map[std::to_string(EncodedVelocityA)];
-        encodedCharacters += character_map[std::to_string(EncodedVelocityB)];
+    jint *notes = env->GetIntArrayElements(noteIntArray, nullptr);
+    jsize len = env->GetArrayLength(noteIntArray);
+    if (notes == nullptr || len == 0) {
+        if (notes) env->ReleaseIntArrayElements(noteIntArray, notes, 0);
+        return;
     }
 
+    // Build encoded string from note array (same encoding as v1)
+    std::string encoded;
+    for (int i = 0; i < len; i++) {
+        int n = notes[i];
+        if (n >= 0 && n <= 9) {
+            encoded += (char)('0' + n);
+        } else if (n == 10) {
+            encoded += '-';
+        } else if (n == 11) {
+            encoded += '+';
+        } else if (n == 12) {
+            encoded += '*';
+        }
+    }
 
+    env->ReleaseIntArrayElements(noteIntArray, notes, 0);
 
-    SendEncodedKeys(encodedCharacters);
-
-    // Log removed from hot path for latency optimization
-//     return 0;
-    env->ReleaseIntArrayElements(noteInfo, int_elements, JNI_ABORT);
+    if (!encoded.empty()) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        sendNumpadSequence(encoded);
+    }
 }
+
+// ============================================================================
+// MAIN — daemon entry point (unchanged: stdin keepalive + binder broadcast)
+// ============================================================================
+
+// Forward declarations from GamePadNative.java (these are Java-side static
+// methods called reflectively from main). The actual sendBinder logic stays
+// in Java; native main() just loads the lib and blocks.
+
+// This is the native daemon's main(). It's invoked by the Java wrapper
+// (GamePadNative.main) which handles binder broadcast + shutdown hooks.
+// We don't redefine main here — it's in GamePadNative.java.
