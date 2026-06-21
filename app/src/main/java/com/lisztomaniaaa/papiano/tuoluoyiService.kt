@@ -210,18 +210,6 @@ class tuoluoyiService : AccessibilityService() {
                             broadcastMidiDevice(current)
                         }
                     }
-                    "intent.tuoluoyi.midi_file_note" -> {
-                        // MIDI file player note event — forward to daemon
-                        val note = intent.getIntExtra("note", -1)
-                        val down = intent.getBooleanExtra("down", false)
-                        val vel = intent.getIntExtra("vel", 0)
-                        if (note in 21..108) {
-                            // velocity dikirim hanya saat toggle ON & note-on.
-                            val v = if (velocityEnabled && down) vel else 0
-                            try { iGamePad?.qwertyKey(note, down, v) }
-                            catch (_: Throwable) {}
-                        }
-                    }
                     "intent.tuoluoyi.set_velocity" -> {
                         // Toggle velocity dari UI (home / popup). Update field
                         // hot-path + persist biar konsisten lintas komponen.
@@ -361,7 +349,6 @@ class tuoluoyiService : AccessibilityService() {
             val internalFilter = IntentFilter().apply {
                 addAction("intent.tuoluoyi.exit")
                 addAction("intent.tuoluoyi.midi_request")
-                addAction("intent.tuoluoyi.midi_file_note")
                 addAction("intent.tuoluoyi.set_velocity")
             }
             ContextCompat.registerReceiver(this, mBroadcastReceiver,
