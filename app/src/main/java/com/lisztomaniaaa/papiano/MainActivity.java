@@ -305,7 +305,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
                     isServiceRunning = true;
                     sp.edit().remove("panel_user_dismissed").apply();
                     startFloatingPanel();
-                    updateStartButton(healthMonitor.getLastState());
+                    updateStartButton(healthMonitor.getLastStatus());
                 });
             } catch (Exception e) {
                 Log.e(TAG, "startPlayback", e);
