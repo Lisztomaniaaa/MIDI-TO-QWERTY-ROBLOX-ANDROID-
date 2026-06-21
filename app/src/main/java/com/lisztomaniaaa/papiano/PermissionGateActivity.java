@@ -128,6 +128,11 @@ public class PermissionGateActivity extends Activity {
      */
     private void runActivation(String method) {
         try {
+            // ── Step 0: Unzip daemon files (starter.sh, .dex, .so) ──
+            // Must happen BEFORE spawning daemon — otherwise starter.sh doesn't exist.
+            postStatus("Preparing files...", "");
+            unzipFiles();
+
             // ── Step 1: Ping activation source ──
             postStatus("Checking " + method + "...", "");
 
@@ -368,6 +373,52 @@ public class PermissionGateActivity extends Activity {
     private String capitalize(String s) {
         if (s == null || s.isEmpty()) return "";
         return s.substring(0, 1).toUpperCase() + s.substring(1);
+    }
+
+    // ═══════════ UNZIP DAEMON FILES ═══════════
+
+    /**
+     * Extract starter.sh, GyroNative.dex, libtuoluoyi.so to external files dir.
+     * These are required for the daemon to start. Must run before spawnDaemon().
+     */
+    private void unzipFiles() {
+        java.io.File extDir = getExternalFilesDir(null);
+        if (extDir == null) return;
+        String base = extDir.getPath();
+
+        try {
+            java.io.InputStream is = getAssets().open("starter.sh");
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(base + "/starter.sh");
+            byte[] buf = new byte[4096]; int len;
+            while ((len = is.read(buf)) != -1) fos.write(buf, 0, len);
+            is.close(); fos.close();
+        } catch (Exception ignored) {}
+
+        try {
+            java.util.zip.ZipFile zip = new java.util.zip.ZipFile(getPackageResourcePath());
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                if (entry.getName().equals("classes4.dex")) {
+                    java.io.InputStream in = zip.getInputStream(entry);
+                    java.io.FileOutputStream out = new java.io.FileOutputStream(base + "/GyroNative.dex");
+                    byte[] buf = new byte[4096]; int l;
+                    while ((l = in.read(buf)) > 0) out.write(buf, 0, l);
+                    in.close(); out.close();
+                    break;
+                }
+            }
+            zip.close();
+        } catch (Exception ignored) {}
+
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream(
+                    getApplicationInfo().nativeLibraryDir + "/libtuoluoyi.so");
+            java.io.FileOutputStream out = new java.io.FileOutputStream(base + "/libtuoluoyi.so");
+            byte[] buf = new byte[4096]; int l;
+            while ((l = in.read(buf)) > 0) out.write(buf, 0, l);
+            in.close(); out.close();
+        } catch (Exception ignored) {}
     }
 
     // ═══════════ LIFECYCLE ═══════════
