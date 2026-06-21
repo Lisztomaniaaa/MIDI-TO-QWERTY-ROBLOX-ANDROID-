@@ -608,15 +608,49 @@ class tuoluoyiService : AccessibilityService() {
 
         // Stabilkan pilihan device: kalau device current masih ada di list,
         // tetap pake itu (jangan flap ke device lain meskipun urutan
-        // mm.devices berubah). Baru fallback ke first.
-        val target = outputCapable.firstOrNull { it.id == currentMidiDeviceId }
-            ?: outputCapable.first()
+        // mm.devices berubah). Baru fallback pake priority: hardware > virtual.
+        //
+        // AUTO MODE FIX: banyak user install app MIDI file player (mis.
+        // MIDI Voyager, Music Score Pad, dll) yg register virtual MIDI device.
+        // Kalau kita blindly ambil .first(), virtual device itu bisa "menang"
+        // dari real piano user → user harus uninstall app itu tiap mau main.
+        //
+        // Priority: USB (TYPE_USB=1) > Bluetooth (TYPE_BLUETOOTH=2) > Virtual (TYPE_VIRTUAL=3).
+        // Kalau gak ada hardware device sama sekali, baru fallback ke virtual.
+        //
+        // PREEMPT: kalau lagi pegang virtual device tapi hardware baru muncul,
+        // otomatis switch ke hardware (user colok piano → langsung pindah).
+        val currentDevice = outputCapable.firstOrNull { it.id == currentMidiDeviceId }
+        val hardware = outputCapable.filter { it.type != MidiDeviceInfo.TYPE_VIRTUAL }
+
+        val target: MidiDeviceInfo = if (currentDevice != null) {
+            // Current device masih ada. Tapi kalau itu virtual dan ada hardware
+            // yg baru available, preempt ke hardware.
+            if (currentDevice.type == MidiDeviceInfo.TYPE_VIRTUAL && hardware.isNotEmpty()) {
+                Log.d(TAG, "Preempt: switching from virtual -> hardware device")
+                hardware.firstOrNull { it.type == MidiDeviceInfo.TYPE_USB }
+                    ?: hardware.first()
+            } else {
+                currentDevice // tetap pake yg sekarang
+            }
+        } else {
+            // Device lama ilang, pilih yg baru pake priority
+            if (hardware.isNotEmpty()) {
+                hardware.firstOrNull { it.type == MidiDeviceInfo.TYPE_USB }
+                    ?: hardware.first()
+            } else {
+                // No hardware — fall back to virtual (better than nothing)
+                outputCapable.first()
+            }
+        }
 
         if (target.id == currentMidiDeviceId && midiOutputPort != null) {
             return
         }
 
-        Log.d(TAG, "MIDI switching device: $currentMidiDeviceId -> ${target.id}")
+        Log.d(TAG, "MIDI switching device: $currentMidiDeviceId -> ${target.id}" +
+            " (type=${target.type}," +
+            " name=${target.properties.getString(MidiDeviceInfo.PROPERTY_NAME) ?: "?"})")
         try { handleDevice(target) } catch (e: Throwable) {
             Log.e(TAG, "handleDevice from rescan", e)
         }
