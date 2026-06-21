@@ -16,7 +16,6 @@ import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.drawable.Icon
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -32,7 +31,6 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.RemoteViews
-import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import androidx.core.content.ContextCompat
@@ -71,11 +69,6 @@ class FloatingPanelService : Service() {
     private var tvMidi: TextView? = null
     private var tvServiceDot: TextView? = null
     private var tvServiceStatus: TextView? = null
-    private var sbOpacity: SeekBar? = null
-    private var tvOpacityValue: TextView? = null
-
-
-
     private var swVelocity: Switch? = null
 
     companion object {
@@ -84,7 +77,6 @@ class FloatingPanelService : Service() {
         private const val NOTIF_ID = 2
 
         private const val PREFS = "data"
-        private const val KEY_OPACITY = "floating_opacity"
 
         private const val KEY_X = "floating_x"
         private const val KEY_Y = "floating_y"
@@ -100,7 +92,6 @@ class FloatingPanelService : Service() {
          */
         const val KEY_USER_DISMISSED = "panel_user_dismissed"
 
-        private const val DEFAULT_OPACITY = 80
         private const val POLL_MS = 2000L
         private const val DRAG_SLOP_DP = 5
     }
@@ -295,7 +286,6 @@ class FloatingPanelService : Service() {
 
         bindPanelChildren(view)
         setupPanelHandlers(view, params)
-        applyOpacity(sp.getInt(KEY_OPACITY, DEFAULT_OPACITY))
         renderMidi(lastMidiName, lastMidiConnected)
         requestMidiSnapshot()
     }
@@ -304,8 +294,6 @@ class FloatingPanelService : Service() {
         tvMidi = view.findViewById(R.id.tv_midi)
         tvServiceDot = view.findViewById(R.id.tv_service_dot)
         tvServiceStatus = view.findViewById(R.id.tv_service_status)
-        sbOpacity = view.findViewById(R.id.sb_opacity)
-        tvOpacityValue = view.findViewById(R.id.tv_opacity_value)
 
         // Velocity toggle
         swVelocity = view.findViewById(R.id.sw_velocity)
@@ -336,30 +324,7 @@ class FloatingPanelService : Service() {
             performNuclearTeardown()
         }
 
-        sbOpacity?.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                if (!fromUser) return
-                applyOpacity(p)
-                tvOpacityValue?.text = "$p%"
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {
-                sp.edit()
-                    .putInt(KEY_OPACITY, s?.progress ?: DEFAULT_OPACITY)
-                    .apply()
-            }
-        })
 
-
-    }
-
-    private fun applyOpacity(percent: Int) {
-        val clamped = percent.coerceIn(0, 100)
-        try {
-            panelView?.background?.alpha = (255 * clamped / 100).coerceIn(0, 255)
-        } catch (t: Throwable) {
-            Log.w(TAG, "applyOpacity", t)
-        }
     }
 
     /* ---------------- BUBBLE ---------------- */
@@ -373,7 +338,6 @@ class FloatingPanelService : Service() {
         panelView = null
         panelParams = null
         tvMidi = null; tvServiceDot = null; tvServiceStatus = null
-        sbOpacity = null; tvOpacityValue = null
 
         if (bubbleView != null) return
 
