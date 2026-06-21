@@ -325,7 +325,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
             }
             ui.post(() -> {
                 isServiceRunning = false;
-                updateStartButton(healthMonitor.getLastState());
+                updateStartButton(healthMonitor.getLastStatus());
             });
         });
     }
