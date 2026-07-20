@@ -100,6 +100,11 @@ class tuoluoyiService : AccessibilityService() {
      *
      * Flow: daemon mati → binderDied() → cleanup iGamePad → auto-respawn →
      * daemon baru kirim binder via broadcast → handleBinder() re-attach.
+     *
+     * Cuma fire SATU respawn attempt langsung (buat respons cepet). Kalau itu
+     * gagal, bridgeHealthRunnable (jalan tiap BRIDGE_HEALTH_INTERVAL selama
+     * service hidup) yang lanjutin nyoba — gak perlu cascade retry terpisah
+     * di sini, satu periodic loop itu udah cukup dan gak akan nyerah.
      */
     private val binderDeathRecipient = android.os.IBinder.DeathRecipient {
         Log.w(TAG, "!!! BINDER DIED: daemon process killed mid-session. " +
@@ -120,26 +125,19 @@ class tuoluoyiService : AccessibilityService() {
                     .putExtra("alive", false))
             } catch (_: Throwable) {}
 
-            // Auto-respawn daemon
             respawnDaemon()
-
-            // Safety net: kalau setelah 8 detik masih null (respawn gagal),
-            // coba sekali lagi. Ini handle case di mana Shizuku lagi restart
-            // atau system lagi sibuk.
-            mainHandler.postDelayed({
-                if (iGamePad == null) {
-                    Log.w(TAG, "Post-death respawn: still null after 8s, retry...")
-                    respawnDaemon()
-                }
-            }, 8000L)
         }
     }
 
     /**
-     * Periodic bridge health check. Jalan TERUS selama service hidup (bukan
-     * cuma sekali di onServiceConnected). Interval 15 detik. Detect case di
-     * mana DeathRecipient miss (rare, tapi possible kalau binder proxy udah
-     * di-GC sebelum daemon mati) atau daemon hang tanpa crash.
+     * Periodic bridge health check — the ONE recovery loop for this service.
+     * Jalan TERUS selama service hidup (bukan cuma sekali di onServiceConnected),
+     * tiap BRIDGE_HEALTH_INTERVAL. Covers every case:
+     *   - iGamePad null (belum pernah connect, atau respawn sebelumnya gagal)
+     *     -> keep retrying, gak pernah nyerah selama service ini hidup.
+     *   - iGamePad non-null tapi binder-nya dead (DeathRecipient miss — rare,
+     *     tapi possible kalau binder proxy udah di-GC sebelum daemon mati, atau
+     *     daemon hang tanpa crash) -> cleanup + respawn.
      */
     private val bridgeHealthRunnable: Runnable = object : Runnable {
         override fun run() {
@@ -151,17 +149,6 @@ class tuoluoyiService : AccessibilityService() {
         }
     }
 
-    /**
-     * Cek apakah bridge masih hidup. Kalau iGamePad != null tapi binder-nya
-     * dead (pingBinder() false), force cleanup + respawn.
-     *
-     * Kalau iGamePad SUDAH null (initial connect gagal, atau retry
-     * sebelumnya abis tanpa berhasil), dulu function ini langsung return
-     * dan gak pernah nyoba lagi — servicenya diem selamanya sampai user
-     * manual reopen app. Sekarang kita keep retrying tiap interval ini
-     * (15s) selama service hidup, jadi daemon akhirnya nyambung begitu
-     * Shizuku/root/system_server selesai "sibuk".
-     */
     private fun checkBridgeHealth() {
         val gp = iGamePad
         if (gp == null) {
@@ -389,36 +376,13 @@ class tuoluoyiService : AccessibilityService() {
             midiHandler?.postDelayed(rescanRunnable, 3000L)
         }, 1500L)
 
-        // Bridge health check: 6 detik setelah service connect, kalau iGamePad
-        // masih null artinya daemon belum kirim binder. AUTO-RESPAWN daemon via
-        // Shizuku/root supaya user gak perlu balik ke MainActivity dan pencet
-        // Activate manual lagi.
-        mainHandler.postDelayed({
-            if (iGamePad == null) {
-                Log.w(TAG, "Bridge health check FAIL after 6s: iGamePad still null. " +
-                        "Auto-respawning daemon...")
-
-                respawnDaemon()
-
-                // Cek lagi 5 detik setelah respawn — kalau masih null, coba
-                // sekali lagi. Sebelumnya block ini kosong (dead code), jadi
-                // kalau percobaan pertama gagal, gak ada retry lagi sampai
-                // periodic bridgeHealthRunnable pertama jalan di 15s.
-                mainHandler.postDelayed({
-                    if (iGamePad == null) {
-                        Log.w(TAG, "Post-connect respawn: still null after 11s, retrying...")
-                        respawnDaemon()
-                    }
-                }, 5000L)
-            }
-        }, 6000L)
-
-        // Start periodic bridge health check. Jalan TERUS setiap 15 detik
-        // selama service hidup. Ini safety net kedua di atas DeathRecipient
-        // — detect kasus di mana binder proxy di-GC atau daemon hang tanpa
-        // crash (gak trigger binderDied). Tanpa ini, kalau DeathRecipient
-        // miss, user stuck sampai restart app manual.
-        mainHandler.postDelayed(bridgeHealthRunnable, BRIDGE_HEALTH_INTERVAL)
+        // Start the bridge health check loop — first run 6s after connect
+        // (enough time for the daemon's sticky broadcast to arrive on a normal
+        // start; if iGamePad is still null at that point it auto-respawns),
+        // then it keeps rescheduling itself every BRIDGE_HEALTH_INTERVAL for as
+        // long as the service is alive. One loop covers both "never connected"
+        // and "connected then died" — no separate cascade of one-shot timers.
+        mainHandler.postDelayed(bridgeHealthRunnable, 6000L)
 
         // Floating panel auto-on: kalau user udah granting SYSTEM_ALERT_WINDOW
         // DAN belum dismiss panel via tombol ✕, hidupin panel pas accessibility
@@ -440,14 +404,15 @@ class tuoluoyiService : AccessibilityService() {
 
     /**
      * Re-spawn daemon process via Shizuku atau root (sesuai activation_method
-     * yg user pilih waktu Activate). Dipanggil kalau bridge null setelah 6s,
-     * dan sekarang juga dari periodic checkBridgeHealth() selama iGamePad
-     * masih null (lihat checkBridgeHealth).
+     * yg user pilih waktu Activate). Dipanggil dari binderDeathRecipient
+     * (respons cepet pas daemon mati mid-session) dan dari checkBridgeHealth
+     * (retry berkelanjutan selama iGamePad masih null). Ini SATU-SATUNYA
+     * tempat yang memicu respawn di seluruh app — PermissionHealthMonitor
+     * (punya MainActivity) cuma observer, gak lagi ikut memicu respawn sendiri.
      *
-     * Delegated ke DaemonControl supaya loop ini berbagi cooldown/in-flight
-     * guard dengan PermissionHealthMonitor punya MainActivity — tanpa itu,
-     * dua loop recovery independen bisa nge-trigger starter.sh bersamaan dan
-     * numpuk beberapa proses daemon.
+     * Delegated ke DaemonControl buat cooldown/in-flight guard, jaga-jaga
+     * kalau ada dua trigger (mis. binder death + periodic check) nyaris
+     * bersamaan.
      */
     private fun respawnDaemon() {
         DaemonControl.respawn(this)

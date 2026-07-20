@@ -27,8 +27,14 @@ import java.util.concurrent.Executors;
  * and the monitor keeps polling. If conditions recover (user restarts
  * Shizuku, daemon auto-respawns), fires healthy callback → banner dismissed.
  *
- * Auto-recovery: when transitioning UNHEALTHY → HEALTHY, triggers
- * re-activation attempt (spawn daemon if binder is missing but source is alive).
+ * This class is a pure OBSERVER — it reports status, it does not drive
+ * recovery. Respawning the daemon is tuoluoyiService's job (its own
+ * health-check loop runs for as long as the AccessibilityService is alive,
+ * independent of this Activity's lifecycle). This monitor used to also
+ * trigger its own respawn attempts, which both duplicated that loop and
+ * tied the app's ONLY continuous recovery mechanism to MainActivity being
+ * alive — if the Activity was destroyed (e.g. backgrounded and reclaimed
+ * by the system), recovery stopped entirely until the app was reopened.
  */
 public class PermissionHealthMonitor {
 
@@ -129,10 +135,13 @@ public class PermissionHealthMonitor {
             newStatus = Status.HEALTHY;
             message = "Active";
         } else if (sourceAlive && !binderAlive) {
-            // Source alive but binder dead — daemon probably crashed, can auto-recover
+            // Source alive but binder dead — daemon probably crashed. Recovery
+            // itself is driven by tuoluoyiService's own health-check loop (it
+            // runs for as long as the AccessibilityService is alive, independent
+            // of whether this Activity exists) — this monitor only reports
+            // status for the UI, it doesn't trigger the respawn itself.
             newStatus = Status.RECOVERING;
             message = "Daemon disconnected. Auto-recovering...";
-            attemptAutoRecovery();
         } else {
             newStatus = Status.UNHEALTHY;
             String method = getMethod();
@@ -201,23 +210,6 @@ public class PermissionHealthMonitor {
             Log.w(TAG, "scanMidi", t);
         }
         return result;
-    }
-
-    /**
-     * Auto-recovery: re-spawn daemon if source is alive but binder is dead.
-     * Non-blocking — fires and forgets, next health check will verify.
-     *
-     * Delegated to DaemonControl, which shares a cooldown/in-flight guard
-     * with tuoluoyiService's own recovery loop. Previously this ran fully
-     * independently every 3s while MainActivity was alive AND could race
-     * with the service's respawn calls, stacking duplicate daemon processes.
-     * It was also the ONLY continuous recovery loop in the app — tied to
-     * MainActivity's lifecycle, so it stopped the moment that Activity was
-     * destroyed (e.g. backgrounded and reclaimed by the system), leaving the
-     * daemon permanently disconnected until the app was reopened manually.
-     */
-    private void attemptAutoRecovery() {
-        DaemonControl.respawn(context);
     }
 
     private String getMethod() {
