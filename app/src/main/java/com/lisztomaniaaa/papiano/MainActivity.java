@@ -364,6 +364,11 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
             try {
                 sendBroadcast(new Intent("intent.tuoluoyi.exit"));
             } catch (Throwable ignored) {}
+            // Fallback: closeAndExit() over the binder does nothing if the
+            // binder is already dead. Without this, the daemon process
+            // (spawned by Shizuku/root, outside our own process) can be
+            // orphaned and keep running in the background indefinitely.
+            DaemonControl.kill(this);
 
             // Step 4: Clear session
             sp.edit()

@@ -206,37 +206,18 @@ public class PermissionHealthMonitor {
     /**
      * Auto-recovery: re-spawn daemon if source is alive but binder is dead.
      * Non-blocking — fires and forgets, next health check will verify.
+     *
+     * Delegated to DaemonControl, which shares a cooldown/in-flight guard
+     * with tuoluoyiService's own recovery loop. Previously this ran fully
+     * independently every 3s while MainActivity was alive AND could race
+     * with the service's respawn calls, stacking duplicate daemon processes.
+     * It was also the ONLY continuous recovery loop in the app — tied to
+     * MainActivity's lifecycle, so it stopped the moment that Activity was
+     * destroyed (e.g. backgrounded and reclaimed by the system), leaving the
+     * daemon permanently disconnected until the app was reopened manually.
      */
     private void attemptAutoRecovery() {
-        String method = getMethod();
-        java.io.File extDir = context.getExternalFilesDir(null);
-        String base = extDir != null ? extDir.getPath() : context.getFilesDir().getPath();
-        String cmd = "sh " + base + "/starter.sh";
-
-        try {
-            switch (method) {
-                case "shizuku": {
-                    if (rikka.shizuku.Shizuku.checkSelfPermission()
-                            != android.content.pm.PackageManager.PERMISSION_GRANTED) return;
-                    Process p = rikka.shizuku.Shizuku.newProcess(
-                            new String[]{"sh", "-c", cmd}, null, null);
-                    p.waitFor();
-                    break;
-                }
-                case "root": {
-                    Process p = Runtime.getRuntime().exec("su");
-                    java.io.OutputStream o = p.getOutputStream();
-                    o.write((cmd + "\nexit\n").getBytes());
-                    o.flush();
-                    o.close();
-                    p.waitFor();
-                    break;
-                }
-            }
-            Log.d(TAG, "Auto-recovery: daemon respawn attempted via " + method);
-        } catch (Throwable t) {
-            Log.w(TAG, "autoRecovery failed", t);
-        }
+        DaemonControl.respawn(context);
     }
 
     private String getMethod() {

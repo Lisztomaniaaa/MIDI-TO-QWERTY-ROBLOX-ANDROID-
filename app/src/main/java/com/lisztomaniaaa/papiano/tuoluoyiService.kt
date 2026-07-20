@@ -154,9 +154,20 @@ class tuoluoyiService : AccessibilityService() {
     /**
      * Cek apakah bridge masih hidup. Kalau iGamePad != null tapi binder-nya
      * dead (pingBinder() false), force cleanup + respawn.
+     *
+     * Kalau iGamePad SUDAH null (initial connect gagal, atau retry
+     * sebelumnya abis tanpa berhasil), dulu function ini langsung return
+     * dan gak pernah nyoba lagi — servicenya diem selamanya sampai user
+     * manual reopen app. Sekarang kita keep retrying tiap interval ini
+     * (15s) selama service hidup, jadi daemon akhirnya nyambung begitu
+     * Shizuku/root/system_server selesai "sibuk".
      */
     private fun checkBridgeHealth() {
-        val gp = iGamePad ?: return // null = belum pernah connect ATAU udah di-handle DeathRecipient
+        val gp = iGamePad
+        if (gp == null) {
+            respawnDaemon()
+            return
+        }
         val binder = currentBinder
         if (binder == null || !binder.pingBinder()) {
             Log.w(TAG, "Bridge health check: binder dead/unreachable. Cleaning up + respawn.")
@@ -389,11 +400,14 @@ class tuoluoyiService : AccessibilityService() {
 
                 respawnDaemon()
 
-                // Cek lagi 5 detik setelah respawn — kalau masih null, kasih
-                // diagnostic terakhir biar user tau bantuan apa yg dibutuhin.
+                // Cek lagi 5 detik setelah respawn — kalau masih null, coba
+                // sekali lagi. Sebelumnya block ini kosong (dead code), jadi
+                // kalau percobaan pertama gagal, gak ada retry lagi sampai
+                // periodic bridgeHealthRunnable pertama jalan di 15s.
                 mainHandler.postDelayed({
                     if (iGamePad == null) {
-
+                        Log.w(TAG, "Post-connect respawn: still null after 11s, retrying...")
+                        respawnDaemon()
                     }
                 }, 5000L)
             }
@@ -426,63 +440,17 @@ class tuoluoyiService : AccessibilityService() {
 
     /**
      * Re-spawn daemon process via Shizuku atau root (sesuai activation_method
-     * yg user pilih waktu Activate). Dipanggil kalau bridge null setelah 6s.
+     * yg user pilih waktu Activate). Dipanggil kalau bridge null setelah 6s,
+     * dan sekarang juga dari periodic checkBridgeHealth() selama iGamePad
+     * masih null (lihat checkBridgeHealth).
      *
-     * Daemon lama yg udah hidup tapi kirim sticky broadcast lama (binder dead)
-     * akan di-replace karena starter.sh spawn process baru — process baru kirim
-     * sticky broadcast fresh dengan binder valid.
-     *
-     * Jalan di background thread (Shizuku.newProcess + Process.waitFor blocking).
+     * Delegated ke DaemonControl supaya loop ini berbagi cooldown/in-flight
+     * guard dengan PermissionHealthMonitor punya MainActivity — tanpa itu,
+     * dua loop recovery independen bisa nge-trigger starter.sh bersamaan dan
+     * numpuk beberapa proses daemon.
      */
     private fun respawnDaemon() {
-        Thread {
-            val method = sp?.getString("activation_method", "shizuku") ?: "shizuku"
-            val extDir = getExternalFilesDir(null)
-            val base = extDir?.path ?: filesDir.path
-            val cmd = "sh $base/starter.sh"
-            try {
-                when (method) {
-                    "root" -> {
-                        val p = Runtime.getRuntime().exec("su")
-                        p.outputStream.use {
-                            it.write("$cmd\nexit\n".toByteArray())
-                            it.flush()
-                        }
-                        p.waitFor()
-                        Log.d(TAG, "respawnDaemon: root path executed")
-                    }
-                    "adb" -> {
-                        // ADB activation berarti user pakai 'adb shell ...' manual
-                        // sebelumnya. Kita gak punya channel untuk re-trigger.
-
-                        return@Thread
-                    }
-                    else -> {
-                        // Shizuku path
-                        if (rikka.shizuku.Shizuku.checkSelfPermission()
-                                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-
-                            return@Thread
-                        }
-                        val p = rikka.shizuku.Shizuku.newProcess(arrayOf("sh"), null, null)
-                        p.outputStream.use {
-                            it.write("$cmd\nexit\n".toByteArray())
-                            it.flush()
-                        }
-                        p.waitFor()
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            p.destroyForcibly()
-                        } else {
-                            @Suppress("DEPRECATION") p.destroy()
-                        }
-                        Log.d(TAG, "respawnDaemon: shizuku path executed")
-                    }
-                }
-            } catch (e: Throwable) {
-                Log.e(TAG, "respawnDaemon", e)
-
-            }
-        }.start()
+        DaemonControl.respawn(this)
     }
 
     /**

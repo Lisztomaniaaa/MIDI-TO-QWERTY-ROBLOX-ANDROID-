@@ -611,6 +611,11 @@ class FloatingPanelService : Service() {
             // Step 3: Kill daemon
             try { GamePadBridge.gamePad?.closeAndExit() } catch (_: Throwable) {}
             try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
+            // Fallback: closeAndExit() over the binder does nothing if the
+            // binder is already dead. Without this, the daemon process
+            // (spawned by Shizuku/root, outside our own process) can be
+            // orphaned and keep running in the background indefinitely.
+            DaemonControl.kill(this)
             GamePadBridge.gamePad = null
 
             // Step 4: Clear session

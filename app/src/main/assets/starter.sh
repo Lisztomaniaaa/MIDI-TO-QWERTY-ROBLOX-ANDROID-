@@ -61,6 +61,14 @@ fi
 
 export CLASSPATH="$CP"
 
+# ---- Kill stale daemon ----
+# Every respawn attempt (Shizuku hiccup, binder death, auto-recovery retry)
+# invokes this script. Without killing the previous instance first, retries
+# stack ANOTHER app_process on top of the old one — multiple processes
+# racing to open /dev/uhid, which is why reconnect can silently fail or
+# leave an orphaned daemon running after the app is closed.
+pkill -f "$TARGET_CLASS" 2>/dev/null
+
 # ---- Spawn daemon ----
 # nohup + & supaya daemon stay running setelah shell session yg invoke
 # starter.sh selesai. >/dev/null 2>&1 utk redirect log (kalau gak,
