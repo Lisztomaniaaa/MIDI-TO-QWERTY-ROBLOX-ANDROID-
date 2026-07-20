@@ -188,7 +188,7 @@ public class PermissionGateActivity extends Activity {
             // ── Step 4: Spawn daemon (fire-and-forget) ──
             postStatus("Starting daemon...", "");
 
-            spawnDaemon(method);
+            DaemonControl.respawn(getApplicationContext());
             // Give it a moment to start, but DON'T wait for binder.
             // tuoluoyiService will receive the binder via sticky broadcast
             // asynchronously. Home screen monitors connection status.
@@ -288,34 +288,6 @@ public class PermissionGateActivity extends Activity {
         }
     }
 
-    private void spawnDaemon(String method) {
-        java.io.File extDir = getExternalFilesDir(null);
-        String base = extDir != null ? extDir.getPath() : getFilesDir().getPath();
-        String cmd = "sh " + base + "/starter.sh";
-
-        try {
-            switch (method) {
-                case "shizuku": {
-                    Process p = rikka.shizuku.Shizuku.newProcess(
-                            new String[]{"sh", "-c", cmd}, null, null);
-                    p.waitFor();
-                    break;
-                }
-                case "root": {
-                    Process p = Runtime.getRuntime().exec("su");
-                    OutputStream o = p.getOutputStream();
-                    o.write((cmd + "\nexit\n").getBytes());
-                    o.flush();
-                    o.close();
-                    p.waitFor();
-                    break;
-                }
-            }
-        } catch (Throwable t) {
-            Log.e(TAG, "spawnDaemon", t);
-        }
-    }
-
     // ═══════════ STATE CHECKS ═══════════
 
     private boolean hasWriteSecureSettings() {
@@ -396,7 +368,7 @@ public class PermissionGateActivity extends Activity {
 
     /**
      * Extract starter.sh, GyroNative.dex, libtuoluoyi.so to external files dir.
-     * These are required for the daemon to start. Must run before spawnDaemon().
+     * These are required for the daemon to start. Must run before DaemonControl.respawn().
      */
     private void unzipFiles() {
         java.io.File extDir = getExternalFilesDir(null);
