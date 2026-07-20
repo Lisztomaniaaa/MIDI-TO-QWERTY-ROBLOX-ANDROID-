@@ -66,12 +66,29 @@ public class PermissionGateActivity extends Activity {
         btnActivate.setOnClickListener(v -> startActivation());
         btnContinue.setOnClickListener(v -> navigateHome());
 
-        // Auto-check: if already fully activated, skip straight to Home
+        // Auto-check: if already fully activated, skip straight to Home.
+        //
+        // Permission + accessibility state survives reboots, but the daemon
+        // itself does NOT — it's a separate Shizuku/root-spawned process,
+        // not an Android service, so a reboot (or Shizuku restarting) kills
+        // it silently. Without a check here, reopening the app after that
+        // skipped straight to a dead connection and left the user staring
+        // at "Recovering..." for however long MainActivity's health-monitor
+        // loop took to notice and retry. Kick a respawn immediately instead.
         bg.execute(() -> {
             if (isFullyActivated()) {
+                if (!isDaemonAlive()) {
+                    DaemonControl.respawn(getApplicationContext());
+                }
                 ui.post(this::navigateHome);
             }
         });
+    }
+
+    private boolean isDaemonAlive() {
+        IGamePad gp = GamePadBridge.gamePad;
+        if (gp == null) return false;
+        try { return gp.asBinder().pingBinder(); } catch (Throwable t) { return false; }
     }
 
     // ═══════════ ATOMIC ACTIVATION ═══════════
@@ -431,9 +448,7 @@ public class PermissionGateActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        getSharedPreferences("data", 0).edit()
-                .putBoolean("session_active", false).apply();
-        startActivity(new Intent(this, LoginActivity.class));
-        finish();
+        // This is the entry point now (no login gate) — don't allow back.
+        finishAffinity();
     }
 }

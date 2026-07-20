@@ -69,9 +69,9 @@ public class SplashActivity extends Activity {
         progAnim.addUpdateListener(a -> progress.setProgress((int) a.getAnimatedValue()));
         progAnim.start();
 
-        // Navigate to LoginActivity after animation completes
+        // Navigate to PermissionGateActivity after animation completes
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            startActivity(new Intent(this, LoginActivity.class));
+            startActivity(new Intent(this, PermissionGateActivity.class));
             overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
             finish();
         }, 2800);
