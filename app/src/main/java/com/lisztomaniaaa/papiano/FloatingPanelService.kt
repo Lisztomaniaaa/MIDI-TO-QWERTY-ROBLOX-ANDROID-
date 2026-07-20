@@ -621,7 +621,6 @@ class FloatingPanelService : Service() {
             // Step 4: Clear session
             try {
                 sp.edit()
-                    .putBoolean("session_active", false)
                     .remove(KEY_USER_DISMISSED)
                     .apply()
             } catch (_: Throwable) {}

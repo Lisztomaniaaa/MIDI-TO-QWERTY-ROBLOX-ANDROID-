@@ -42,7 +42,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Home screen — shown ONLY after login + permission gate passes.
+ * Home screen — shown ONLY after the permission gate passes.
  *
  * Layout:
  *   1. Connection status card (green/red + method)
@@ -372,7 +372,6 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
 
             // Step 4: Clear session
             sp.edit()
-                    .putBoolean("session_active", false)
                     .remove("panel_user_dismissed")
                     .apply();
             GamePadBridge.gamePad = null;
