@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import java.io.InputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -17,7 +18,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Centralizing here gives both loops one cooldown + in-flight guard.
  */
 object DaemonControl {
-    private const val TAG = "DaemonControl"
+    // Same tag as tuoluoyiService — anyone already filtering logcat for
+    // "Papiano" (e.g. MatLog) picks these up automatically, no extra setup.
+    private const val TAG = "PapianoMidi"
     private const val RESPAWN_COOLDOWN_MS = 8_000L
     private const val DAEMON_CLASS = "com.lisztomaniaaa.papiano.GamePadNative"
 
@@ -52,9 +55,21 @@ object DaemonControl {
         val m = method(appContext)
         val cmd = starterCmd(appContext)
         Thread {
-            try { runShell(m, cmd) }
-            catch (t: Throwable) { Log.e(TAG, "respawn", t) }
-            finally { respawnInFlight.set(false) }
+            try {
+                // starter.sh captures the daemon's own stdout/stderr (which
+                // used to vanish into /dev/null — invisible even to a full
+                // logcat capture if app_process crashed on startup) and cats
+                // it back into ITS OWN stdout before exiting, so it's included
+                // in whatever runShell() captures here. One log line now shows
+                // exactly why a respawn attempt did or didn't work.
+                val shellOutput = runShell(m, cmd)
+                Log.w(TAG, "respawn attempt via $m — output: " +
+                        "[${shellOutput.ifBlank { "<empty>" }}]")
+            } catch (t: Throwable) {
+                Log.e(TAG, "respawn", t)
+            } finally {
+                respawnInFlight.set(false)
+            }
         }.start()
     }
 
@@ -70,14 +85,31 @@ object DaemonControl {
         val appContext = context.applicationContext
         val m = method(appContext)
         Thread {
-            try { runShell(m, "pkill -f $DAEMON_CLASS") }
-            catch (t: Throwable) { Log.e(TAG, "kill", t) }
+            try {
+                val out = runShell(m, "pkill -f $DAEMON_CLASS")
+                if (out.isNotBlank()) Log.w(TAG, "kill output: $out")
+            } catch (t: Throwable) {
+                Log.e(TAG, "kill", t)
+            }
         }.start()
     }
 
-    /** MUST run off the main thread — blocks on Process.waitFor(). */
-    private fun runShell(method: String, cmd: String) {
-        when (method) {
+    private fun readAll(stream: InputStream): String = try {
+        stream.bufferedReader().readText()
+    } catch (t: Throwable) {
+        ""
+    }
+
+    /**
+     * MUST run off the main thread — blocks on Process.waitFor(). Returns
+     * everything the shell invocation printed to stdout/stderr: "pm grant" /
+     * "pm path" failures, "No such file", permission denials, AND (thanks to
+     * starter.sh catting it back before exiting) whatever the backgrounded
+     * daemon itself printed in its first second — the actual crash reason if
+     * app_process died on startup, which used to be thrown away entirely.
+     */
+    private fun runShell(method: String, cmd: String): String {
+        return when (method) {
             "root" -> {
                 val p = Runtime.getRuntime().exec("su")
                 p.outputStream.use {
@@ -85,24 +117,28 @@ object DaemonControl {
                     it.flush()
                 }
                 p.waitFor()
+                readAll(p.inputStream) + readAll(p.errorStream)
             }
             "shizuku" -> {
                 if (rikka.shizuku.Shizuku.checkSelfPermission()
                         != android.content.pm.PackageManager.PERMISSION_GRANTED
-                ) return
+                ) return "shizuku permission not granted"
                 val p = rikka.shizuku.Shizuku.newProcess(arrayOf("sh"), null, null)
                 p.outputStream.use {
                     it.write("$cmd\nexit\n".toByteArray())
                     it.flush()
                 }
                 p.waitFor()
+                val out = readAll(p.inputStream) + readAll(p.errorStream)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     p.destroyForcibly()
                 } else {
                     @Suppress("DEPRECATION") p.destroy()
                 }
+                out
             }
             // "adb": user activated manually via adb shell, no channel to re-trigger.
+            else -> ""
         }
     }
 }
