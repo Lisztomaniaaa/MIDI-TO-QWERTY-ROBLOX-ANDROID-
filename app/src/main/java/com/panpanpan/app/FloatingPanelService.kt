@@ -48,7 +48,7 @@ import kotlin.math.abs
  * MainActivity (tombol Start Playing / Stop Playing).
  *
  * Tombol minimize (−) -> bubble bulet 48dp (logo dragon).
- * Tombol close (✕)    -> stopSelf() doang. TIDAK ngirim intent.tuoluoyi.exit
+ * Tombol close (✕)    -> stopSelf() doang. TIDAK ngirim intent.panpanpan.exit
  *                        (yang itu bakal matiin AccessibilityService juga).
  *                        Set flag KEY_USER_DISMISSED biar panel gak di-auto-restart
  *                        sampe user pencet Start Playing lagi. Buat fully stop
@@ -86,7 +86,7 @@ class FloatingPanelService : Service() {
         /**
          * User explicitly closed the floating panel via ✕. While true, none
          * of the auto-launch entry points (MainActivity.onResume,
-         * tuoluoyiService.onServiceConnected, MainActivity.startBtn re-press)
+         * MidiBridgeService.onServiceConnected, MainActivity.startBtn re-press)
          * should bring the panel back. Reset only when user presses
          * Start Playing again from MainActivity.
          */
@@ -105,17 +105,17 @@ class FloatingPanelService : Service() {
         override fun onReceive(context: Context, intent: Intent) {
             try {
                 when (intent.action) {
-                    "intent.tuoluoyi.midi_device" -> {
+                    "intent.panpanpan.midi_device" -> {
                         val name = intent.getStringExtra("name") ?: ""
                         val connected = intent.getBooleanExtra(
                             "connected", name.isNotEmpty()
                         )
                         onMidiUpdate(name, connected)
                     }
-                    "intent.tuoluoyi.exit" -> {
+                    "intent.panpanpan.exit" -> {
                         stopSelf()
                     }
-                    "intent.papiano.force_remove_overlay" -> {
+                    "intent.panpanpan.force_remove_overlay" -> {
                         // Nuclear teardown: remove views IMMEDIATELY so overlay
                         // disappears even before process dies.
                         removeAllOverlayViews()
@@ -213,9 +213,9 @@ class FloatingPanelService : Service() {
 
     private fun registerReceivers() {
         val f = IntentFilter().apply {
-            addAction("intent.tuoluoyi.midi_device")
-            addAction("intent.tuoluoyi.exit")
-            addAction("intent.papiano.force_remove_overlay")
+            addAction("intent.panpanpan.midi_device")
+            addAction("intent.panpanpan.exit")
+            addAction("intent.panpanpan.force_remove_overlay")
         }
         try {
             ContextCompat.registerReceiver(
@@ -228,7 +228,7 @@ class FloatingPanelService : Service() {
     }
 
     /**
-     * Minta tuoluoyiService re-broadcast MIDI device state-nya yg sekarang.
+     * Minta MidiBridgeService re-broadcast MIDI device state-nya yg sekarang.
      * Tanpa ini, panel yg baru di-inflate gak tau device apa yg lagi
      * connected (broadcastMidiDevice di service di-dedup pake lastBroadcastName,
      * jadi gak ada re-broadcast spontan kalau device-nya stay connected).
@@ -236,7 +236,7 @@ class FloatingPanelService : Service() {
     private fun requestMidiSnapshot() {
         try {
             sendBroadcast(
-                Intent("intent.tuoluoyi.midi_request").setPackage(packageName)
+                Intent("intent.panpanpan.midi_request").setPackage(packageName)
             )
         } catch (t: Throwable) {
             Log.w(TAG, "requestMidiSnapshot", t)
@@ -308,7 +308,7 @@ class FloatingPanelService : Service() {
         swVelocity?.setOnCheckedChangeListener { _, checked ->
             sp.edit().putBoolean("velocity_enabled", checked).apply()
             try {
-                sendBroadcast(Intent("intent.tuoluoyi.set_velocity")
+                sendBroadcast(Intent("intent.panpanpan.set_velocity")
                     .setPackage(packageName)
                     .putExtra("enabled", checked))
             } catch (t: Throwable) {
@@ -502,7 +502,7 @@ class FloatingPanelService : Service() {
     }
 
     private fun isAccessibilityRunning(): Boolean = try {
-        val svc = ComponentName(packageName, tuoluoyiService::class.java.name)
+        val svc = ComponentName(packageName, MidiBridgeService::class.java.name)
             .flattenToString()
         val cur = Settings.Secure.getString(
             contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
@@ -595,7 +595,7 @@ class FloatingPanelService : Service() {
             // Step 2: Disable accessibility service
             try {
                 val svcName = android.content.ComponentName(packageName,
-                    tuoluoyiService::class.java.name).flattenToString()
+                    MidiBridgeService::class.java.name).flattenToString()
                 val cur = android.provider.Settings.Secure.getString(
                     contentResolver,
                     android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
@@ -610,7 +610,7 @@ class FloatingPanelService : Service() {
 
             // Step 3: Kill daemon
             try { GamePadBridge.gamePad?.closeAndExit() } catch (_: Throwable) {}
-            try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
+            try { sendBroadcast(Intent("intent.panpanpan.exit")) } catch (_: Throwable) {}
             // Fallback: closeAndExit() over the binder does nothing if the
             // binder is already dead. Without this, the daemon process
             // (spawned by Shizuku/root, outside our own process) can be

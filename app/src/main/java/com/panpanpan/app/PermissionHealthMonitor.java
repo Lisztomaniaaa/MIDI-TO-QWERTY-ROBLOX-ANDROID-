@@ -28,7 +28,7 @@ import java.util.concurrent.Executors;
  * Shizuku, daemon auto-respawns), fires healthy callback → banner dismissed.
  *
  * This class is mostly an OBSERVER — it reports status, it does not drive
- * daemon recovery. Respawning the daemon is tuoluoyiService's job (its own
+ * daemon recovery. Respawning the daemon is MidiBridgeService's job (its own
  * health-check loop runs for as long as the AccessibilityService is alive,
  * independent of this Activity's lifecycle). This monitor used to also
  * trigger its own respawn attempts, which both duplicated that loop and
@@ -38,7 +38,7 @@ import java.util.concurrent.Executors;
  *
  * ONE exception: it does call AccessibilityGate.ensureEnabled() when the
  * service is listed-but-not-bound. That has to happen from out here — if
- * the AccessibilityService genuinely isn't bound, tuoluoyiService can't be
+ * the AccessibilityService genuinely isn't bound, MidiBridgeService can't be
  * alive to fix it from the inside, so no other component in the app can
  * drive that particular recovery.
  */
@@ -145,11 +145,11 @@ public class PermissionHealthMonitor {
             // enabled while Android never actually bound it — e.g. Android 13+
             // "Restricted settings" silently blocking a sideloaded app's
             // service. No amount of daemon-respawn retrying will ever fix
-            // this, since tuoluoyiService (the thing that would catch the
+            // this, since MidiBridgeService (the thing that would catch the
             // daemon's binder) isn't even running. This is the ONE exception
-            // to "PermissionHealthMonitor only observes, tuoluoyiService drives
+            // to "PermissionHealthMonitor only observes, MidiBridgeService drives
             // recovery" — it has to be handled from out here, because if this
-            // is broken, tuoluoyiService structurally cannot be alive to fix
+            // is broken, MidiBridgeService structurally cannot be alive to fix
             // it from the inside.
             newStatus = Status.RECOVERING;
             message = "Accessibility service not active. Retrying...";
@@ -157,7 +157,7 @@ public class PermissionHealthMonitor {
         } else if (sourceAlive && !binderAlive) {
             // Source alive, accessibility genuinely bound, but binder dead —
             // daemon probably crashed. Recovery itself is driven by
-            // tuoluoyiService's own health-check loop (it runs for as long as
+            // MidiBridgeService's own health-check loop (it runs for as long as
             // the AccessibilityService is alive, independent of whether this
             // Activity exists) — this monitor only reports status for the UI,
             // it doesn't trigger the respawn itself.

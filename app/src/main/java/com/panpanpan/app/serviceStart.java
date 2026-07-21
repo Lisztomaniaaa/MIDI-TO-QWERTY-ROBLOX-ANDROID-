@@ -14,9 +14,9 @@ public class serviceStart extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && getSharedPreferences("data", 0).getBoolean("foreground", true)) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled())
                 return;
-            startForegroundService(new Intent(this, tuoluoyiService.class));
+            startForegroundService(new Intent(this, MidiBridgeService.class));
         } else
-            startService(new Intent(this, tuoluoyiService.class));
+            startService(new Intent(this, MidiBridgeService.class));
     }
 
 

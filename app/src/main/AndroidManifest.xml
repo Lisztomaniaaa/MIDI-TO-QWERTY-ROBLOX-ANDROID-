@@ -52,7 +52,7 @@
         </activity>
 
         <!-- Accessibility Service (MIDI bridge) -->
-        <service android:name=".tuoluoyiService"
+        <service android:name=".MidiBridgeService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>

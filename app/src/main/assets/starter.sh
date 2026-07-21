@@ -3,7 +3,7 @@
 #
 # Job:
 #   1. Grant WRITE_SECURE_SETTINGS ke app supaya bisa toggle accessibility.
-#   2. Copy libtuoluoyi.so ke /data/local/tmp (writable + executable
+#   2. Copy libpanpanpan.so ke /data/local/tmp (writable + executable
 #      dari shell uid).
 #   3. Spawn daemon process (com.panpanpan.app.GamePadNative) via
 #      app_process dengan CLASSPATH yg punya class itu.
@@ -25,12 +25,12 @@ TARGET_CLASS="com.panpanpan.app.GamePadNative"
 pm grant "$PKG" android.permission.WRITE_SECURE_SETTINGS
 
 # ---- Native lib ----
-# libtuoluoyi.so harus di lokasi yg executable. /data/local/tmp = group
+# libpanpanpan.so harus di lokasi yg executable. /data/local/tmp = group
 # 'shell', readable + executable by shell uid. /data/data/<pkg>/files/
 # bisa juga, tapi shell uid gak punya akses tulis ke /data/data milik app.
-LIBSO_SRC="$(dirname "$0")/libtuoluoyi.so"
+LIBSO_SRC="$(dirname "$0")/libpanpanpan.so"
 CACHE_DIR="/data/local/tmp"
-LIBSO_DST="$CACHE_DIR/libtuoluoyi.so"
+LIBSO_DST="$CACHE_DIR/libpanpanpan.so"
 
 if [ -e "$LIBSO_SRC" ]; then
   cp -f "$LIBSO_SRC" "$LIBSO_DST"

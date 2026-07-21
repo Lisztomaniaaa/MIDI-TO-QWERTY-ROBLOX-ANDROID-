@@ -9,7 +9,7 @@ public class serviceStop extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         setTheme(android.R.style.Theme_NoDisplay);
         super.onCreate(savedInstanceState);
-        stopService(new Intent(this, tuoluoyiService.class));
+        stopService(new Intent(this, MidiBridgeService.class));
     }
 
     @Override
