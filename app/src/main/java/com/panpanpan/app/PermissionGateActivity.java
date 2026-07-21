@@ -7,6 +7,7 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
@@ -134,6 +135,16 @@ public class PermissionGateActivity extends Activity {
     }
 
     /**
+     * How long to poll for the daemon actually connecting before giving up
+     * and letting the user continue anyway (the background recovery loop
+     * keeps trying regardless — see MidiBridgeService). Generous on purpose:
+     * a fixed short guess is exactly what caused two different bugs here
+     * before (see history below), so this polls instead of guessing once.
+     */
+    private static final long ACTIVATION_TIMEOUT_MS = 12_000L;
+    private static final long ACTIVATION_POLL_INTERVAL_MS = 400L;
+
+    /**
      * Activation — runs on bg thread, posts status updates to UI.
      *
      * Used to be an "atomic" gate: grant permission, sleep(300), verify;
@@ -142,18 +153,23 @@ public class PermissionGateActivity extends Activity {
      * fixed propagation delay — if a slower device took a bit longer than
      * 300/500ms, the gate declared FAILURE even though the step would have
      * succeeded moments later, sending the user back to square one for no
-     * real reason. (This is also the flow the app's original, pre-rebuild
-     * version never had — it just ran the shell command once and let
-     * status reflect reality, no synchronous pass/fail gate at all.)
+     * real reason.
      *
-     * Now: fire permission grant + accessibility enable + daemon spawn in
-     * sequence, don't gate on guessed timing. The ONLY hard-fail check left
-     * is "is the activation source (Shizuku/root) even reachable", which is
-     * an instant, real check (no sleep/guessing involved). Everything else's
-     * real status is reported continuously by PermissionHealthMonitor /
-     * MidiBridgeService once we land on Home — same source of truth the rest
-     * of the app already relies on, instead of a one-time snapshot taken
-     * moments after firing off async shell commands.
+     * That was "fixed" by removing the verification entirely — grant
+     * permission, enable accessibility, spawn daemon, sleep(500) for UX
+     * pacing only, then declare "Activated!" UNCONDITIONALLY. That traded
+     * one bug for a worse one: the gate now says "Activated!" even when
+     * NONE of the previous steps actually worked (Shizuku permission never
+     * granted, daemon never spawned, accessibility never bound) — the only
+     * hard check left was "is Shizuku/root reachable at all", which says
+     * nothing about whether activation actually succeeded.
+     *
+     * Fixed properly this time: poll for the daemon ACTUALLY connecting,
+     * with a generous timeout instead of a single guessed-delay snapshot.
+     * If it connects, great — same "Activated!" screen as before. If it's
+     * still not connected after a generous wait, say so honestly instead of
+     * lying, but still let the user continue to Home (where the persistent
+     * recovery loop keeps retrying regardless of this screen).
      */
     private void runActivation(String method) {
         try {
@@ -181,13 +197,13 @@ public class PermissionGateActivity extends Activity {
             enableAccessibility();
             DaemonControl.respawn(getApplicationContext());
 
-            // Brief pause for UX pacing only — not a pass/fail gate. The
-            // daemon connects asynchronously via sticky broadcast ->
-            // MidiBridgeService -> GamePadBridge; Home screen's health monitor
-            // shows the real, live status from here on.
-            Thread.sleep(500);
-
-            postSuccess();
+            // ── Poll for the daemon actually connecting ──
+            postStatus("Connecting to daemon...", "");
+            if (waitForDaemon(ACTIVATION_TIMEOUT_MS)) {
+                postSuccess();
+            } else {
+                postPending();
+            }
 
         } catch (InterruptedException e) {
             postFailed("Activation interrupted.", "");
@@ -197,6 +213,15 @@ public class PermissionGateActivity extends Activity {
         } finally {
             activating = false;
         }
+    }
+
+    private boolean waitForDaemon(long timeoutMs) throws InterruptedException {
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (isDaemonAlive()) return true;
+            Thread.sleep(ACTIVATION_POLL_INTERVAL_MS);
+        }
+        return isDaemonAlive();
     }
 
     // ═══════════ SUB-STEPS ═══════════
@@ -322,6 +347,26 @@ public class PermissionGateActivity extends Activity {
             tvDetail.setText("All systems ready. Tap Continue.");
             tvDetail.setVisibility(View.VISIBLE);
             tvDetail.setTextColor(ContextCompat.getColor(this, R.color.green));
+            progressBar.setVisibility(View.GONE);
+            btnActivate.setVisibility(View.GONE);
+            btnContinue.setVisibility(View.VISIBLE);
+        });
+    }
+
+    /**
+     * Daemon didn't connect within ACTIVATION_TIMEOUT_MS. Say so honestly
+     * instead of declaring "Activated!" — but still let the user continue,
+     * since MidiBridgeService's own recovery loop keeps retrying in the
+     * background regardless of what this screen shows.
+     */
+    private void postPending() {
+        ui.post(() -> {
+            tvStatus.setText("Still connecting...");
+            tvStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_gold));
+            tvDetail.setText("Taking longer than usual on this device — it'll keep " +
+                    "trying in the background. Check the Home screen for live status.");
+            tvDetail.setVisibility(View.VISIBLE);
+            tvDetail.setTextColor(ContextCompat.getColor(this, R.color.accent_gold));
             progressBar.setVisibility(View.GONE);
             btnActivate.setVisibility(View.GONE);
             btnContinue.setVisibility(View.VISIBLE);
