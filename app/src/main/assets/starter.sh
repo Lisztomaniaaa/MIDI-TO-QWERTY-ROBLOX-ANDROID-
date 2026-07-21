@@ -5,7 +5,7 @@
 #   1. Grant WRITE_SECURE_SETTINGS ke app supaya bisa toggle accessibility.
 #   2. Copy libtuoluoyi.so ke /data/local/tmp (writable + executable
 #      dari shell uid).
-#   3. Spawn daemon process (com.lisztomaniaaa.papiano.GamePadNative) via
+#   3. Spawn daemon process (com.panpanpan.app.GamePadNative) via
 #      app_process dengan CLASSPATH yg punya class itu.
 #
 # CLASSPATH STRATEGY:
@@ -19,8 +19,8 @@
 # dex file mana class-nya disimpan. Jauh lebih robust dari nge-tebak
 # mana dex yg punya GamePadNative.
 
-PKG="papiano.fun"
-TARGET_CLASS="com.lisztomaniaaa.papiano.GamePadNative"
+PKG="com.panpanpan.app"
+TARGET_CLASS="com.panpanpan.app.GamePadNative"
 
 pm grant "$PKG" android.permission.WRITE_SECURE_SETTINGS
 

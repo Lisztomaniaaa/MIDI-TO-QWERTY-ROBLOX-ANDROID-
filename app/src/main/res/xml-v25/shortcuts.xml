@@ -19,8 +19,8 @@
         android:shortcutShortLabel="@string/shortcut_off">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetClass="com.lisztomaniaaa.papiano.serviceStop"
-            android:targetPackage="papiano.fun" />
+            android:targetClass="com.panpanpan.app.serviceStop"
+            android:targetPackage="com.panpanpan.app" />
         <categories android:name="android.shortcut.conversation" />
         <capability-binding android:key="actions.intent.CREATE_MESSAGE" />
     </shortcut>
@@ -32,8 +32,8 @@
         android:shortcutShortLabel="@string/shortcut_on">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetClass="com.lisztomaniaaa.papiano.serviceStart"
-            android:targetPackage="papiano.fun" />
+            android:targetClass="com.panpanpan.app.serviceStart"
+            android:targetPackage="com.panpanpan.app" />
         <categories android:name="android.shortcut.conversation" />
         <capability-binding android:key="actions.intent.CREATE_MESSAGE" />
     </shortcut>

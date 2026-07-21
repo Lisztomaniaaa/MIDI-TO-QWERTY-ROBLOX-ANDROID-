@@ -1,4 +1,4 @@
-package com.lisztomaniaaa.papiano
+package com.panpanpan.app
 
 /**
  * In-process bridge holder for the daemon's IGamePad binder.

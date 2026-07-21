@@ -1,4 +1,4 @@
-package com.lisztomaniaaa.papiano;
+package com.panpanpan.app;
 
 interface IGamePad {
 
