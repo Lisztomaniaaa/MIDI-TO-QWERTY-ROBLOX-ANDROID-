@@ -135,22 +135,35 @@ public class PermissionGateActivity extends Activity {
     }
 
     /**
-     * Atomic activation — runs ALL steps sequentially on bg thread.
-     * Posts status updates to UI. Stops at first failure.
+     * Activation — runs on bg thread, posts status updates to UI.
      *
-     * NOTE: Daemon spawn is FIRE-AND-FORGET. We do NOT wait for binder.
-     * The daemon connects asynchronously via sticky broadcast → tuoluoyiService
-     * handles it → GamePadBridge gets set. Home screen shows live status.
-     * Original app never blocked on daemon — neither should we.
+     * Used to be an "atomic" gate: grant permission, sleep(300), verify;
+     * enable accessibility, sleep(500), verify; spawn daemon, sleep(1000);
+     * only THEN declare success. Those sleep-then-verify steps guessed a
+     * fixed propagation delay — if a slower device took a bit longer than
+     * 300/500ms, the gate declared FAILURE even though the step would have
+     * succeeded moments later, sending the user back to square one for no
+     * real reason. (This is also the flow the app's original, pre-rebuild
+     * version never had — it just ran the shell command once and let
+     * status reflect reality, no synchronous pass/fail gate at all.)
+     *
+     * Now: fire permission grant + accessibility enable + daemon spawn in
+     * sequence, don't gate on guessed timing. The ONLY hard-fail check left
+     * is "is the activation source (Shizuku/root) even reachable", which is
+     * an instant, real check (no sleep/guessing involved). Everything else's
+     * real status is reported continuously by PermissionHealthMonitor /
+     * tuoluoyiService once we land on Home — same source of truth the rest
+     * of the app already relies on, instead of a one-time snapshot taken
+     * moments after firing off async shell commands.
      */
     private void runActivation(String method) {
         try {
-            // ── Step 0: Unzip daemon files (starter.sh, .dex, .so) ──
+            // ── Unzip daemon files (starter.sh, .dex, .so) ──
             // Must happen BEFORE spawning daemon — otherwise starter.sh doesn't exist.
             postStatus("Preparing files...", "");
             unzipFiles();
 
-            // ── Step 1: Ping activation source ──
+            // ── Ping activation source — the one real, instant check ──
             postStatus("Checking " + method + "...", "");
 
             boolean sourceAlive = pingSource(method);
@@ -162,39 +175,19 @@ public class PermissionGateActivity extends Activity {
                 return;
             }
 
-            // ── Step 2: Grant WRITE_SECURE_SETTINGS ──
-            postStatus("Granting permission...", "");
+            // ── Grant permission, enable accessibility, spawn daemon ──
+            postStatus("Activating...", "");
 
-            boolean permGranted = grantPermission(method);
-            // Verify
-            Thread.sleep(300);
-            if (!hasWriteSecureSettings()) {
-                postFailed("Permission grant failed.",
-                        "Could not grant WRITE_SECURE_SETTINGS.");
-                return;
-            }
-
-            // ── Step 3: Enable Accessibility Service ──
-            postStatus("Enabling service...", "");
-
+            grantPermission(method);
             enableAccessibility();
-            Thread.sleep(500);
-            if (!isAccessibilityEnabled()) {
-                postFailed("Could not enable accessibility.",
-                        "Try enabling manually in Settings > Accessibility.");
-                return;
-            }
-
-            // ── Step 4: Spawn daemon (fire-and-forget) ──
-            postStatus("Starting daemon...", "");
-
             DaemonControl.respawn(getApplicationContext());
-            // Give it a moment to start, but DON'T wait for binder.
-            // tuoluoyiService will receive the binder via sticky broadcast
-            // asynchronously. Home screen monitors connection status.
-            Thread.sleep(1000);
 
-            // ── ALL STEPS PASSED → go to Home ──
+            // Brief pause for UX pacing only — not a pass/fail gate. The
+            // daemon connects asynchronously via sticky broadcast ->
+            // tuoluoyiService -> GamePadBridge; Home screen's health monitor
+            // shows the real, live status from here on.
+            Thread.sleep(500);
+
             postSuccess();
 
         } catch (InterruptedException e) {
