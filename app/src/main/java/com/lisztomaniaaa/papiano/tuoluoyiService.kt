@@ -6,7 +6,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -420,24 +419,13 @@ class tuoluoyiService : AccessibilityService() {
 
     /**
      * Re-write Settings.Secure on each connect so the service survives reboots
-     * without the user having to dive into Accessibility settings.
+     * without the user having to dive into Accessibility settings. Delegated
+     * to AccessibilityGate for consistency with the other two call sites
+     * (MainActivity, PermissionGateActivity) that do the same thing.
      * Run on midiHandler thread.
      */
     private fun autoGrantAccessibilityIfNeeded() {
-        val svcName = ComponentName(packageName, tuoluoyiService::class.java.name).flattenToString()
-        try {
-            val current = Settings.Secure.getString(
-                contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
-            if (!current.contains(svcName)) {
-                val newVal = if (current.isEmpty()) svcName else "$svcName:$current"
-                Settings.Secure.putInt(contentResolver,
-                    Settings.Secure.ACCESSIBILITY_ENABLED, 1)
-                Settings.Secure.putString(contentResolver,
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, newVal)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "autoGrant: ${e.message}")
-        }
+        AccessibilityGate.ensureEnabled(this)
     }
 
     /* ---------------- MIDI (semua di midiHandler thread) ---------------- */

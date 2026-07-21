@@ -27,14 +27,20 @@ import java.util.concurrent.Executors;
  * and the monitor keeps polling. If conditions recover (user restarts
  * Shizuku, daemon auto-respawns), fires healthy callback → banner dismissed.
  *
- * This class is a pure OBSERVER — it reports status, it does not drive
- * recovery. Respawning the daemon is tuoluoyiService's job (its own
+ * This class is mostly an OBSERVER — it reports status, it does not drive
+ * daemon recovery. Respawning the daemon is tuoluoyiService's job (its own
  * health-check loop runs for as long as the AccessibilityService is alive,
  * independent of this Activity's lifecycle). This monitor used to also
  * trigger its own respawn attempts, which both duplicated that loop and
  * tied the app's ONLY continuous recovery mechanism to MainActivity being
  * alive — if the Activity was destroyed (e.g. backgrounded and reclaimed
  * by the system), recovery stopped entirely until the app was reopened.
+ *
+ * ONE exception: it does call AccessibilityGate.ensureEnabled() when the
+ * service is listed-but-not-bound. That has to happen from out here — if
+ * the AccessibilityService genuinely isn't bound, tuoluoyiService can't be
+ * alive to fix it from the inside, so no other component in the app can
+ * drive that particular recovery.
  */
 public class PermissionHealthMonitor {
 
@@ -134,12 +140,27 @@ public class PermissionHealthMonitor {
         if (sourceAlive && binderAlive) {
             newStatus = Status.HEALTHY;
             message = "Active";
+        } else if (sourceAlive && !AccessibilityGate.isActuallyBound(context)) {
+            // The Settings.Secure string can say our AccessibilityService is
+            // enabled while Android never actually bound it — e.g. Android 13+
+            // "Restricted settings" silently blocking a sideloaded app's
+            // service. No amount of daemon-respawn retrying will ever fix
+            // this, since tuoluoyiService (the thing that would catch the
+            // daemon's binder) isn't even running. This is the ONE exception
+            // to "PermissionHealthMonitor only observes, tuoluoyiService drives
+            // recovery" — it has to be handled from out here, because if this
+            // is broken, tuoluoyiService structurally cannot be alive to fix
+            // it from the inside.
+            newStatus = Status.RECOVERING;
+            message = "Accessibility service not active. Retrying...";
+            AccessibilityGate.ensureEnabled(context);
         } else if (sourceAlive && !binderAlive) {
-            // Source alive but binder dead — daemon probably crashed. Recovery
-            // itself is driven by tuoluoyiService's own health-check loop (it
-            // runs for as long as the AccessibilityService is alive, independent
-            // of whether this Activity exists) — this monitor only reports
-            // status for the UI, it doesn't trigger the respawn itself.
+            // Source alive, accessibility genuinely bound, but binder dead —
+            // daemon probably crashed. Recovery itself is driven by
+            // tuoluoyiService's own health-check loop (it runs for as long as
+            // the AccessibilityService is alive, independent of whether this
+            // Activity exists) — this monitor only reports status for the UI,
+            // it doesn't trigger the respawn itself.
             newStatus = Status.RECOVERING;
             message = "Daemon disconnected. Auto-recovering...";
         } else {

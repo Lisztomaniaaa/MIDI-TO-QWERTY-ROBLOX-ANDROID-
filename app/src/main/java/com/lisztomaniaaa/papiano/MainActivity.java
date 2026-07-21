@@ -391,18 +391,10 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
     // ═══════════ HELPER METHODS ═══════════
 
     private void enableAccessibilityService() {
-        String svcName = new ComponentName(getPackageName(),
-                tuoluoyiService.class.getName()).flattenToString();
-        String current = Settings.Secure.getString(getContentResolver(),
-                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-        if (current == null) current = "";
-        if (!current.contains(svcName)) {
-            String next = current.isEmpty() ? svcName : svcName + ":" + current;
-            Settings.Secure.putInt(getContentResolver(),
-                    Settings.Secure.ACCESSIBILITY_ENABLED, 1);
-            Settings.Secure.putString(getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, next);
-        }
+        // See AccessibilityGate — plain "does the string already contain it"
+        // isn't enough, since Android 13+ restricted settings can let that
+        // write succeed while never actually binding the service.
+        AccessibilityGate.ensureEnabled(this);
     }
 
     private void disableAccessibilityService() {
