@@ -8,34 +8,14 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
-import android.os.IInterface;
 import android.os.RemoteException;
-import android.os.SystemClock;
 import android.util.Log;
-import android.view.IRotationWatcher;
-import android.view.InputDevice;
-import android.view.InputEvent;
-import android.view.KeyEvent;
-import android.view.MotionEvent;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 import java.util.Scanner;
 
 public class GamePadNative {
-    static boolean isUInputCreated = false, isUHidCreated = false, isInputManagerCreated = false;
-    static boolean invertAll = false, invertX = false, invertY = false;
-    static float sensitivityXMode0, sensitivityYMode0, sensitivityXMode1, sensitivityYMode1, sensitivityXMode2, sensitivityYMode2;
-    static float lastX = 0, lastY = 0;
-    static int currentMode = 0;
-    static android.hardware.input.InputManager im;
-    static Method injectInputEventMethod;
-    static MotionEvent.PointerProperties[] properties;
-    static MotionEvent.PointerCoords[] pointerCoords;
-
+    static boolean isUHidCreated = false;
 
     public static void main(String[] args) {
         //检查权限
@@ -62,8 +42,6 @@ public class GamePadNative {
                 if (isUHidCreated) isUHidCreated = !nativeCloseUHid();
             }
         });
-
-        watchDeviceRotation(); //监测设备是否位于逆向横屏状态，如果是逆向横屏则将陀螺仪数据乘以-1
 
         try {
             Scanner scanner = new Scanner(System.in);
@@ -93,78 +71,12 @@ public class GamePadNative {
         System.out.println("Stop GamePad Service.\n");
     }
 
-    private static boolean getInputManager() {
-        try {
-            Method getInstanceMethod = android.hardware.input.InputManager.class.getDeclaredMethod("getInstance");
-            im = (android.hardware.input.InputManager) getInstanceMethod.invoke(null);
-            if (im == null) {
-                System.err.println("Unable to get inputManager for mode2.");
-                return false;
-            }
-            injectInputEventMethod = im.getClass().getMethod("injectInputEvent", InputEvent.class, int.class);
-            injectInputEventMethod.setAccessible(true);
-        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-            System.err.println("Unable to get inputManager for mode2.");
-            return false;
-        }
-        properties = new MotionEvent.PointerProperties[1];
-        properties[0] = new MotionEvent.PointerProperties();
-        properties[0].id = 0;
-        properties[0].toolType = MotionEvent.TOOL_TYPE_UNKNOWN;
-        pointerCoords = new MotionEvent.PointerCoords[1];
-        pointerCoords[0] = new MotionEvent.PointerCoords();
-        pointerCoords[0].clear();
-        return true;
-    }
-
-
-    private static void watchDeviceRotation() {
-
-        //注册旋转观测器
-        try {
-            Class<?> serviceManager = Class.forName("android.os.ServiceManager");
-            Method getService = serviceManager.getMethod("getService", String.class);
-            IBinder binder = (IBinder) getService.invoke(null, "window");
-            Class<?> windowManagerStub = Class.forName("android.view.IWindowManager$Stub");
-            Method asInterface = windowManagerStub.getMethod("asInterface", IBinder.class);
-            IInterface windowManager = (IInterface) asInterface.invoke(null, binder);
-            if (windowManager == null) {
-                System.err.println("Unable to watch rotation. Skip it.");
-                return;
-            }
-            Class<?> cls = windowManager.getClass();
-            try {
-                invertAll = (int) cls.getMethod("getDefaultDisplayRotation").invoke(windowManager) == 3;
-            } catch (NoSuchMethodException unused) {
-                invertAll = (int) cls.getMethod("getRotation").invoke(windowManager) == 3;
-            }
-            //新建旋转观测器
-            IRotationWatcher rotationWatcher = new IRotationWatcher.Stub() {
-                @Override
-                public void onRotationChanged(int rotation) {
-                    invertAll = rotation == 3;
-                }
-            };
-            try {
-                cls.getMethod("watchRotation", IRotationWatcher.class, int.class).invoke(windowManager, rotationWatcher, 0);
-            } catch (NoSuchMethodException e) {
-                cls.getMethod("watchRotation", IRotationWatcher.class).invoke(windowManager, rotationWatcher);
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-    }
-
-
     static native boolean nativeCreateUHid();
 
     static native boolean nativeCloseUHid();
 
 
     static native void nativeQwertyKey(int noteNumber, boolean isDown, int velocity);
-
-    static native void nativePianoRoomsKey(int[] noteIntArray);
 
     private static void sendBinderToAppByStickyBroadcast() {
 
@@ -173,56 +85,15 @@ public class GamePadNative {
             IBinder binder = new IGamePad.Stub() {
                 @Override
                 public void qwertyKey(int noteNumber, boolean isDown, int velocity) throws RemoteException {
-//                    int status = 500;
-                    // Do something!
-
                     // QWERTY mode supports proper hold/sustain:
                     //   isDown=true  -> add note to held set, emit aggregated HID report
                     //   isDown=false -> remove note from held set, emit updated report
-                    // Limit 6KRO (HID boot-protocol). Lihat native-lib.cpp utk detail.
                     //
                     // velocity: 0 = velocity OFF (QWERTY polos). >0 = Visual Piano
                     // velocity mode -> native akan tap Alt+<velKey> (skema 32-step)
                     // sebelum not kalau level velocity berubah. Gating ON/OFF
                     // dilakukan di tuoluoyiService (kirim 0 saat toggle OFF).
                     nativeQwertyKey(noteNumber, isDown, velocity);
-
-//                    if (isDown) {
-//                        //Log.d(MainActivity.TAG, "Key: " + Hid.keyboardCode[2])
-//                        status=nativePianoKey(noteNumber, isDown);
-//                    } else {
-//                        status=nativePianoKey(noteNumber, isDown);
-//                    }
-
-
-
-//                    if (status == 0) {
-//                        return "Acknowledged : " + noteNumber + " " + isDown;
-//                    } else {
-//                        return "Failure";
-//                    }
-                }
-
-                @Override
-                public void pianoRoomsKey(int[] noteIntArray) throws RemoteException {
-//                    List<Integer> noteArrayList = new ArrayList<>();
-//                    for (int note : noteIntList) {
-//                        noteArrayList.add(note);
-//                    }
-//                    Log.d("A:", noteArrayList.toString());
-                    Log.d("B:", Arrays.toString(noteIntArray));
-
-                    nativePianoRoomsKey(noteIntArray);
-                }
-
-                @Override
-                public void changeMode(int mode) throws RemoteException {
-                    currentMode = mode;
-                }
-
-                @Override
-                public int getCurrentMode() throws RemoteException {
-                    return currentMode;
                 }
 
                 @Override

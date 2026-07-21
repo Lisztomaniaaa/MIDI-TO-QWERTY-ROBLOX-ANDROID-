@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Background-only MIDI -> virtual keyboard bridge. No popup overlay, no UI.
  *
- * Mode is locked to QWERTY. Octave range covers the full 88-key span (21..108 = A0..C8).
+ * QWERTY only. Octave range covers the full 88-key span (21..108 = A0..C8).
  * MIDI device name is broadcast to MainActivity via "intent.tuoluoyi.midi_device".
  *
  * STABILITY NOTES (POCO X3 Pro / MIUI 14 bug-report driven):
@@ -259,10 +259,9 @@ class tuoluoyiService : AccessibilityService() {
 
         iGamePad = IGamePad.Stub.asInterface(binder)
         try {
-            iGamePad?.changeMode(0)
             isGamePadCreated = iGamePad?.create() == true
         } catch (e: RemoteException) {
-            Log.e(TAG, "changeMode/create", e)
+            Log.e(TAG, "create", e)
         }
 
         if (isGamePadCreated) {
@@ -305,19 +304,9 @@ class tuoluoyiService : AccessibilityService() {
      */
     private val warnedNullBridge = AtomicBoolean(false)
 
-    /**
-     * Support legacy daemon (com.tile.tuoluoyi.BinderContainer) supaya app
-     * gak crash kalau daemon lama dari install sebelumnya masih hidup.
-     * Lihat penjelasan lengkap di MainActivity.extractBinder.
-     */
     private fun extractBinder(intent: Intent): android.os.IBinder? = try {
         when (val raw = intent.getParcelableExtra<android.os.Parcelable>("binder")) {
             is BinderContainer -> raw.binder
-            is com.tile.tuoluoyi.BinderContainer -> {
-                Log.w(TAG, "Legacy daemon detected, sending exit")
-                try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
-                raw.binder
-            }
             else -> null
         }
     } catch (t: Throwable) {
