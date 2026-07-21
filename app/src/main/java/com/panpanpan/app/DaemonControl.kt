@@ -1,4 +1,4 @@
-package com.lisztomaniaaa.papiano
+package com.panpanpan.app
 
 import android.content.Context
 import android.os.Build
@@ -22,7 +22,7 @@ object DaemonControl {
     // "Papiano" (e.g. MatLog) picks these up automatically, no extra setup.
     private const val TAG = "PapianoMidi"
     private const val RESPAWN_COOLDOWN_MS = 8_000L
-    private const val DAEMON_CLASS = "com.lisztomaniaaa.papiano.GamePadNative"
+    private const val DAEMON_CLASS = "com.panpanpan.app.GamePadNative"
 
     private val respawnInFlight = AtomicBoolean(false)
     @Volatile private var lastRespawnAttemptMs = 0L

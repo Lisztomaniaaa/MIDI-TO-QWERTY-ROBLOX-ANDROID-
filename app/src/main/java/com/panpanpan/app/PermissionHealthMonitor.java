@@ -1,4 +1,4 @@
-package com.lisztomaniaaa.papiano;
+package com.panpanpan.app;
 
 import android.content.ComponentName;
 import android.content.Context;

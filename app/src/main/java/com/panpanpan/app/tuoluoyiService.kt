@@ -1,4 +1,4 @@
-package com.lisztomaniaaa.papiano
+package com.panpanpan.app
 
 import android.accessibilityservice.AccessibilityService
 import android.app.Notification

@@ -1,6 +1,6 @@
-package com.lisztomaniaaa.papiano;
+package com.panpanpan.app;
 
-import static com.lisztomaniaaa.papiano.MainActivity.TAG;
+import static com.panpanpan.app.MainActivity.TAG;
 
 import android.app.IApplicationThread;
 import android.content.IIntentReceiver;
@@ -139,7 +139,7 @@ public class GamePadNative {
             // real crash log from exactly that scenario). Scoping also stops
             // this app's own stale sticky broadcast from lingering visible
             // to every other app on the device indefinitely.
-            intent.setPackage("papiano.fun");
+            intent.setPackage("com.panpanpan.app");
 
             Object iActivityManagerObj; // 获取 IActivityManager 类
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

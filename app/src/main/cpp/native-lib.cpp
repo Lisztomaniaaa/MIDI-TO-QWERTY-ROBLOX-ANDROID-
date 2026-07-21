@@ -431,7 +431,7 @@ static void uhidDrainLoop(int fd) {
 
 extern "C"
 JNIEXPORT jboolean JNICALL
-Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclass clazz) {
+Java_com_panpanpan_app_GamePadNative_nativeCreateUHid(JNIEnv *env, jclass clazz) {
     __android_log_print(ANDROID_LOG_WARN, TAG, "HELLO WORLD THIS IS FROM JNI");
 
     // Daemon process priority: this JNI runs inside the helper daemon spawned
@@ -490,7 +490,7 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCreateUHid(JNIEnv *env, jclas
 
 extern "C"
 JNIEXPORT jboolean JNICALL
-Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCloseUHid(JNIEnv *env, jclass clazz) {
+Java_com_panpanpan_app_GamePadNative_nativeCloseUHid(JNIEnv *env, jclass clazz) {
 
     // Stop drain thread first so it doesn't race against fd close.
     g_drainRun.store(false);
@@ -519,7 +519,7 @@ Java_com_lisztomaniaaa_papiano_GamePadNative_nativeCloseUHid(JNIEnv *env, jclass
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_lisztomaniaaa_papiano_GamePadNative_nativeQwertyKey(JNIEnv *env,
+Java_com_panpanpan_app_GamePadNative_nativeQwertyKey(JNIEnv *env,
                                                      jclass thiz,
                                                      jint noteNumber,
                                                      jboolean isDown,

@@ -4,12 +4,12 @@ plugins {
 }
 
 android {
-    namespace 'com.lisztomaniaaa.papiano'
+    namespace 'com.panpanpan.app'
     compileSdk 35
     ndkVersion '25.2.9519653'
 
     defaultConfig {
-        applicationId "papiano.fun"
+        applicationId "com.panpanpan.app"
         minSdk 24
         targetSdk 35
         versionCode 15
