@@ -571,46 +571,40 @@ Java_com_panpanpan_app_GamePadNative_nativeQwertyKey(JNIEnv *env,
             }
         }
 
-        // Meta collision fix: if new note has a DIFFERENT modifier than
-        // what's currently held, drop the held set first. HID report only
-        // has 1 meta byte shared across every held key (NKRO bitmap removed
-        // the 6-key cap, but not this — it's one modifier byte regardless of
-        // how many keys are held) — mixing notes with different modifiers
-        // causes wrong key interpretation.
-        // e.g. holding "q" (meta=0x00) + pressing "ctrl_1" (meta=0x01)
-        // would make Roblox see Ctrl+q = wrong note.
-        // Roblox sustain is absolute (hold=sound, release=stop) so
-        // dropping doesn't cause audio gaps — notes just get re-triggered.
-        //
-        // HEX-COLLISION CASE (the subtle one):
+        // HEX-COLLISION CASE — the only situation that actually needs
+        // special handling:
         //   Many natural+sharp pairs share the SAME HID keycode and only
         //   differ by modifier — e.g. note 69 (A4 = "p") and note 70
         //   (Bb4 = "P") both use 0x13. If user plays A→Bb with A still
-        //   held (legato), the next emitHeldReport would write a report
-        //   that only flips the modifier; key 0x13 stays down across
-        //   reports so the kernel emits NO KEY_P transition and Roblox's
-        //   InputBegan handler never fires for the new note → Bb is
-        //   silent even though shift went down. We MUST insert an
-        //   intermediate empty report so the shared key cycles up→down,
-        //   forcing Roblox to see a fresh InputBegan with the new
-        //   modifier state.
+        //   held (legato), a report that just flips the modifier bit would
+        //   leave key 0x13 down across both reports, so the kernel never
+        //   emits a KEY_P transition and Roblox's InputBegan never fires
+        //   for the new note → Bb is silent even though Shift went down.
+        //   Fix: drop just the colliding entry and emit that release first,
+        //   forcing the shared key to cycle up before the new note pushes
+        //   it back down with the new modifier.
         //
-        //   When there's NO hex collision (e.g. holding "q" then
-        //   pressing "!"), the single emitHeldReport at the end of the
-        //   press path already produces a clean release-old + press-new
-        //   transition in one report — no intermediate write needed.
-        if (!g_heldKeys.empty()) {
-            int currentMeta = 0;
-            bool hexCollision = false;
-            for (const auto& h : g_heldKeys) {
-                currentMeta |= h.meta;
-                if (h.hex == key.hex) hexCollision = true;
-            }
-            if (currentMeta != key.meta) {
-                g_heldKeys.clear();
-                if (hexCollision) {
-                    writeKeyboard(); // empty report — force the shared key to cycle
-                }
+        // This used to also clear the ENTIRE held set (not just the
+        // colliding key) any time a new note's modifier merely DIFFERED
+        // from the aggregate of what was already held — e.g. holding any
+        // plain white-key notes and pressing any sharp/ctrl-range note
+        // would silently cut every other held note. That's overwhelmingly
+        // the common case when playing scales/runs with black keys or
+        // wide chords, not an edge case — real keyboards don't retrigger
+        // already-down keys just because Shift/Ctrl's state changes, and
+        // Roblox piano scripts read discrete per-key InputBegan/Ended
+        // events, not a continuously-polled modifier+key combo, so there's
+        // nothing to actually protect against here. Only the true
+        // hex-collision case (the SAME physical key needing to represent
+        // two different notes) needs a forced cycle.
+        for (const auto& h : g_heldKeys) {
+            if (h.hex == key.hex) {
+                g_heldKeys.erase(
+                    std::remove_if(g_heldKeys.begin(), g_heldKeys.end(),
+                        [&](const HeldKey& hk) { return hk.hex == key.hex; }),
+                    g_heldKeys.end());
+                emitHeldReport(); // release just the shared key, everything else stays down
+                break;
             }
         }
 
