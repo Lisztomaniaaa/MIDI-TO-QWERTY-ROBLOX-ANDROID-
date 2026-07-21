@@ -1,7 +1,6 @@
 package com.lisztomaniaaa.papiano;
 
 import android.app.Activity;
-import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -263,22 +262,7 @@ public class PermissionGateActivity extends Activity {
     }
 
     private void enableAccessibility() {
-        try {
-            String svcName = new ComponentName(getPackageName(),
-                    tuoluoyiService.class.getName()).flattenToString();
-            String current = Settings.Secure.getString(getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            if (current == null) current = "";
-            if (!current.contains(svcName)) {
-                String next = current.isEmpty() ? svcName : svcName + ":" + current;
-                Settings.Secure.putInt(getContentResolver(),
-                        Settings.Secure.ACCESSIBILITY_ENABLED, 1);
-                Settings.Secure.putString(getContentResolver(),
-                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, next);
-            }
-        } catch (Throwable t) {
-            Log.e(TAG, "enableAccessibility", t);
-        }
+        AccessibilityGate.ensureEnabled(this);
     }
 
     // ═══════════ STATE CHECKS ═══════════
@@ -288,16 +272,14 @@ public class PermissionGateActivity extends Activity {
                 == PackageManager.PERMISSION_GRANTED;
     }
 
+    /**
+     * Checks the REAL bound state, not just whether Settings.Secure lists our
+     * service — see AccessibilityGate for why that distinction matters
+     * (Android 13+ restricted settings can let the string-write succeed while
+     * silently blocking the actual bind).
+     */
     private boolean isAccessibilityEnabled() {
-        try {
-            String svcName = new ComponentName(getPackageName(),
-                    tuoluoyiService.class.getName()).flattenToString();
-            String enabled = Settings.Secure.getString(getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            return enabled != null && enabled.contains(svcName);
-        } catch (Throwable t) {
-            return false;
-        }
+        return AccessibilityGate.isActuallyBound(this);
     }
 
     /** Activation = permission + accessibility. Daemon is async. */
