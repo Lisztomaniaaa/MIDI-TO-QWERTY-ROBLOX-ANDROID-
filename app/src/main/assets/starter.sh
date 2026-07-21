@@ -71,6 +71,25 @@ pkill -f "$TARGET_CLASS" 2>/dev/null
 
 # ---- Spawn daemon ----
 # nohup + & supaya daemon stay running setelah shell session yg invoke
-# starter.sh selesai. >/dev/null 2>&1 utk redirect log (kalau gak,
-# stdout/stderr nge-block pas pipe parent close).
-nohup app_process -Djava.library.path="$CACHE_DIR" / "$TARGET_CLASS" >/dev/null 2>&1 &
+# starter.sh selesai.
+#
+# Output DULU dibuang ke /dev/null. Itu artinya kalau app_process langsung
+# crash (ClassNotFoundException, native lib gagal load, /dev/uhid permission
+# denied, dll) — alasannya ilang total, gak keliatan bahkan di logcat, karena
+# gak pernah lewat Android's log system. Ini bikin "daemon gagal connect
+# terus-terusan" gak bisa didiagnosis sama sekali dari sisi app.
+#
+# Fix: redirect ke file di CACHE_DIR (udah kebukti writable, sama kayak
+# LIBSO_DST di atas), tunggu sebentar, terus cat isinya ke stdout SCRIPT INI.
+# Caller (DaemonControl.kt) udah capture stdout/stderr dari shell session yg
+# jalanin script ini, jadi apapun yg daemon print keliatan otomatis lewat
+# logcat tag PapianoMidi — gak perlu app baca file lintas-permission.
+LOG_FILE="$CACHE_DIR/papiano_daemon.log"
+rm -f "$LOG_FILE" 2>/dev/null
+nohup app_process -Djava.library.path="$CACHE_DIR" / "$TARGET_CLASS" >"$LOG_FILE" 2>&1 &
+
+sleep 1
+if [ -e "$LOG_FILE" ]; then
+  echo "---- daemon output (first 1s after spawn) ----"
+  cat "$LOG_FILE"
+fi
