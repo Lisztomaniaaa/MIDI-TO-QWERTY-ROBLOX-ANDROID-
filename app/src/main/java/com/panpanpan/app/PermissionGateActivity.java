@@ -190,11 +190,34 @@ public class PermissionGateActivity extends Activity {
                 return;
             }
 
-            // ── Grant permission, enable accessibility, spawn daemon ──
+            // ── Grant permission ──
+            // Unlike the checks removed in the previous fix (which guessed a
+            // fixed propagation delay after an already-completed action),
+            // this is a genuine yes/no answer for whether the Shizuku
+            // permission dialog was actually granted — worth hard-failing on,
+            // since nothing downstream can work without it.
             postStatus("Activating...", "");
 
-            grantPermission(method);
+            if (!grantPermission(method)) {
+                postFailed("Permission not granted.",
+                        method.equals("shizuku")
+                                ? "Shizuku permission was denied or timed out. Tap Retry and allow the popup."
+                                : "Root access denied.");
+                return;
+            }
+
+            // ── Enable accessibility, spawn daemon ──
+            // Confirmed on a real device: the OFF->ON cycle AccessibilityGate
+            // forces doesn't always land on the very first try — give it a
+            // real chance to actually bind, and retry the cycle once if it
+            // didn't, before bothering to spawn the daemon (which is pointless
+            // if MidiBridgeService, the thing that would catch its binder,
+            // isn't even alive yet).
             enableAccessibility();
+            if (!waitForAccessibilityBound(ACCESSIBILITY_BIND_TIMEOUT_MS)) {
+                enableAccessibility();
+                waitForAccessibilityBound(ACCESSIBILITY_BIND_TIMEOUT_MS);
+            }
             DaemonControl.respawn(getApplicationContext());
 
             // ── Poll for the daemon actually connecting ──
@@ -224,6 +247,17 @@ public class PermissionGateActivity extends Activity {
         return isDaemonAlive();
     }
 
+    private static final long ACCESSIBILITY_BIND_TIMEOUT_MS = 5_000L;
+
+    private boolean waitForAccessibilityBound(long timeoutMs) throws InterruptedException {
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (isAccessibilityEnabled()) return true;
+            Thread.sleep(ACTIVATION_POLL_INTERVAL_MS);
+        }
+        return isAccessibilityEnabled();
+    }
+
     // ═══════════ SUB-STEPS ═══════════
 
     private boolean pingSource(String method) {
@@ -247,6 +281,11 @@ public class PermissionGateActivity extends Activity {
         }
     }
 
+    /** How long to wait for a human to notice and tap the Shizuku permission
+     * popup. Generous on purpose — this is waiting on a PERSON, not a system
+     * state propagation delay, so there's no "correct" short guess here. */
+    private static final long SHIZUKU_PERMISSION_TIMEOUT_MS = 60_000L;
+
     private boolean grantPermission(String method) {
         String cmd = "pm grant " + getPackageName()
                 + " android.permission.WRITE_SECURE_SETTINGS";
@@ -255,11 +294,7 @@ public class PermissionGateActivity extends Activity {
                 case "shizuku": {
                     if (rikka.shizuku.Shizuku.checkSelfPermission()
                             != PackageManager.PERMISSION_GRANTED) {
-                        // Request Shizuku permission synchronously-ish
-                        ui.post(() -> rikka.shizuku.Shizuku.requestPermission(0));
-                        Thread.sleep(2000); // wait for user to grant
-                        if (rikka.shizuku.Shizuku.checkSelfPermission()
-                                != PackageManager.PERMISSION_GRANTED) {
+                        if (!requestShizukuPermissionAndWait()) {
                             return false;
                         }
                     }
@@ -283,6 +318,47 @@ public class PermissionGateActivity extends Activity {
         } catch (Throwable t) {
             Log.e(TAG, "grantPermission", t);
             return false;
+        }
+    }
+
+    /**
+     * Shizuku's permission grant is a REAL SYSTEM DIALOG — a human needs
+     * time to notice it and tap Allow. The previous version of this code
+     * called Shizuku.requestPermission(0), blindly slept 2 seconds (nowhere
+     * near enough time for a person to react), and then proceeded regardless
+     * of what the user actually did — the result was never even checked.
+     * That's the same class of bug fixed elsewhere in this flow (guessing a
+     * fixed delay instead of waiting for the real event), but for the most
+     * foundational step: without this permission, EVERYTHING downstream
+     * (WRITE_SECURE_SETTINGS grant, accessibility enable, daemon spawn) is
+     * doomed, silently.
+     *
+     * This waits for Shizuku's actual OnRequestPermissionResultListener
+     * callback instead — exactly what the app's original pre-rebuild version
+     * did — with a generous timeout as a safety net only (not a guess at how
+     * long the user needs; genuinely waiting for their response).
+     */
+    private boolean requestShizukuPermissionAndWait() {
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        final boolean[] granted = {false};
+        final rikka.shizuku.Shizuku.OnRequestPermissionResultListener listener =
+                (requestCode, grantResult) -> {
+                    granted[0] = grantResult == PackageManager.PERMISSION_GRANTED;
+                    latch.countDown();
+                };
+        rikka.shizuku.Shizuku.addRequestPermissionResultListener(listener);
+        try {
+            postStatus("Waiting for Shizuku permission...",
+                    "Check for a system popup and tap Allow.");
+            ui.post(() -> rikka.shizuku.Shizuku.requestPermission(0));
+            boolean fired = latch.await(
+                    SHIZUKU_PERMISSION_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return fired && granted[0];
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            rikka.shizuku.Shizuku.removeRequestPermissionResultListener(listener);
         }
     }
 
