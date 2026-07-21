@@ -258,6 +258,17 @@ public class GamePadNative {
             // 创建 Intent 对象，并将binder作为附加参数
             Intent intent = new Intent("intent.tuoluoyi.sendBinder");
             intent.putExtra("binder", binderContainer);
+            // Scope to our own package. Without this, ANY app on the device
+            // that registers a receiver for this same (unscoped) action name
+            // gets this sticky broadcast too — including forks of the same
+            // upstream project using an identical action string but a
+            // DIFFERENT BinderContainer class. That other app then crashes
+            // with BadParcelableException/ClassNotFoundException trying to
+            // unmarshal a Parcelable class it doesn't have (confirmed via a
+            // real crash log from exactly that scenario). Scoping also stops
+            // this app's own stale sticky broadcast from lingering visible
+            // to every other app on the device indefinitely.
+            intent.setPackage("papiano.fun");
 
             Object iActivityManagerObj; // 获取 IActivityManager 类
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
