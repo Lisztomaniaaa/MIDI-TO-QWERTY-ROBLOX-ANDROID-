@@ -54,9 +54,24 @@ object AccessibilityGate {
     }
 
     /**
-     * Ensure the service is both listed AND actually bound. If it's listed
-     * but not bound (the restricted-settings trap above), force a fresh
-     * OFF->ON transition instead of treating "already listed" as done.
+     * Ensure the service is both listed AND actually bound. Confirmed on a
+     * real device: a plain "add to the list" write is NOT enough to make
+     * AccessibilityManagerService actually bind, even on a fresh install —
+     * only manually toggling the service OFF then back ON in system
+     * Settings made it connect. A straight single write from empty to
+     * listed apparently doesn't reliably trigger a (re-)bind on some
+     * devices/firmwares, but an explicit OFF->ON transition does.
+     *
+     * So this always forces that OFF->ON cycle whenever the service isn't
+     * both listed and bound already — not only in the "listed but stuck
+     * unbound" case. The two writes need a real gap between them: writing
+     * OFF then immediately ON back-to-back risks the OFF change notification
+     * being superseded before AccessibilityManagerService's observer reacts
+     * to it, since both writes land in the same instant. This 300ms is not
+     * a "wait then hope it worked" verification guess (the anti-pattern
+     * removed elsewhere in this app) — it's a deliberate gap between two
+     * writes we are making ourselves, needed for the system to observe the
+     * first one before we make the second.
      */
     @JvmStatic
     fun ensureEnabled(context: Context) {
@@ -70,12 +85,13 @@ object AccessibilityGate {
 
             if (listed && bound) return // genuinely fine, nothing to do
 
-            if (listed && !bound) {
-                Log.w(TAG, "Accessibility service listed in settings but NOT " +
-                        "actually bound (restricted settings?) — forcing OFF->ON cycle")
+            Log.w(TAG, "Accessibility service not actively bound — forcing OFF->ON cycle")
+
+            if (listed) {
                 val without = stripService(current, svcName)
                 Settings.Secure.putString(
                     cr, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, without)
+                Thread.sleep(300)
             }
 
             val base = Settings.Secure.getString(
