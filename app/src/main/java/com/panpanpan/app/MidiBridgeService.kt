@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Background-only MIDI -> virtual keyboard bridge. No popup overlay, no UI.
  *
  * QWERTY only. Octave range covers the full 88-key span (21..108 = A0..C8).
- * MIDI device name is broadcast to MainActivity via "intent.tuoluoyi.midi_device".
+ * MIDI device name is broadcast to MainActivity via "intent.panpanpan.midi_device".
  *
  * STABILITY NOTES (POCO X3 Pro / MIUI 14 bug-report driven):
  * Bug report user nunjukin system_server kena watchdog kill 3x karena deadlock
@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * settle dari accessibility binding. Callback dari MidiManager juga dikirim
  * lewat handler thread itu (bukan main), supaya kalau hang gak nge-block UI.
  */
-class tuoluoyiService : AccessibilityService() {
+class MidiBridgeService : AccessibilityService() {
 
     private var iGamePad: IGamePad? = null
     private var isBroadcastRegistered = false
@@ -58,7 +58,7 @@ class tuoluoyiService : AccessibilityService() {
      * native (yang akan tap Alt+velKey skema 32-step sebelum not). Saat false,
      * kita kirim velocity=0 -> native main QWERTY polos. State disimpan di
      * pref "velocity_enabled" dan di-update live via broadcast
-     * "intent.tuoluoyi.set_velocity". Hot-path (per-not), jadi @Volatile field
+     * "intent.panpanpan.set_velocity". Hot-path (per-not), jadi @Volatile field
      * dibaca langsung tanpa nyentuh SharedPreferences tiap not.
      */
     @Volatile
@@ -116,14 +116,6 @@ class tuoluoyiService : AccessibilityService() {
             isGamePadCreated = false
             currentBinder = null
             warnedNullBridge.set(false)
-
-            // Broadcast status ke floating panel supaya UI tau bridge putus
-            try {
-                sendBroadcast(Intent("intent.tuoluoyi.bridge_status")
-                    .setPackage(packageName)
-                    .putExtra("alive", false))
-            } catch (_: Throwable) {}
-
             respawnDaemon()
         }
     }
@@ -193,11 +185,11 @@ class tuoluoyiService : AccessibilityService() {
         override fun onReceive(context: Context, intent: Intent) {
             try {
                 when (intent.action) {
-                    "intent.tuoluoyi.exit" -> {
+                    "intent.panpanpan.exit" -> {
                         try { disableSelf() } catch (e: Throwable) { Log.w(TAG, "disableSelf", e) }
                     }
-                    "intent.tuoluoyi.sendBinder" -> handleBinder(intent)
-                    "intent.tuoluoyi.midi_request" -> {
+                    "intent.panpanpan.send_binder" -> handleBinder(intent)
+                    "intent.panpanpan.midi_request" -> {
                         // Floating panel minta snapshot state. Force re-broadcast
                         // dgn bypass dedup biar UI dapet info terbaru meskipun
                         // device-nya gak berubah sejak last broadcast.
@@ -207,7 +199,7 @@ class tuoluoyiService : AccessibilityService() {
                             broadcastMidiDevice(current)
                         }
                     }
-                    "intent.tuoluoyi.set_velocity" -> {
+                    "intent.panpanpan.set_velocity" -> {
                         // Toggle velocity dari UI (home / popup). Update field
                         // hot-path + persist biar konsisten lintas komponen.
                         val enabled = intent.getBooleanExtra("enabled", false)
@@ -271,13 +263,6 @@ class tuoluoyiService : AccessibilityService() {
             // Publish live binder for direct (no-broadcast) note delivery.
             GamePadBridge.gamePad = iGamePad
             GamePadBridge.velocityEnabled = velocityEnabled
-
-            // Broadcast status ke floating panel: bridge is alive
-            try {
-                sendBroadcast(Intent("intent.tuoluoyi.bridge_status")
-                    .setPackage(packageName)
-                    .putExtra("alive", true))
-            } catch (_: Throwable) {}
         } else {
             Log.e(TAG, "Virtual HID create FAILED (uHID open needs root/shell perm)")
             try { iGamePad?.closeAndExit() } catch (_: RemoteException) {}
@@ -311,7 +296,7 @@ class tuoluoyiService : AccessibilityService() {
         }
     } catch (t: Throwable) {
         Log.w(TAG, "extractBinder failed: ${t.javaClass.simpleName}")
-        try { sendBroadcast(Intent("intent.tuoluoyi.exit")) } catch (_: Throwable) {}
+        try { sendBroadcast(Intent("intent.panpanpan.exit")) } catch (_: Throwable) {}
         null
     }
 
@@ -330,12 +315,12 @@ class tuoluoyiService : AccessibilityService() {
 
         try {
             ContextCompat.registerReceiver(this, mBroadcastReceiver,
-                IntentFilter("intent.tuoluoyi.sendBinder"),
+                IntentFilter("intent.panpanpan.send_binder"),
                 ContextCompat.RECEIVER_EXPORTED)
             val internalFilter = IntentFilter().apply {
-                addAction("intent.tuoluoyi.exit")
-                addAction("intent.tuoluoyi.midi_request")
-                addAction("intent.tuoluoyi.set_velocity")
+                addAction("intent.panpanpan.exit")
+                addAction("intent.panpanpan.midi_request")
+                addAction("intent.panpanpan.set_velocity")
             }
             ContextCompat.registerReceiver(this, mBroadcastReceiver,
                 internalFilter,
@@ -570,7 +555,7 @@ class tuoluoyiService : AccessibilityService() {
         if (name == lastBroadcastName) return
         lastBroadcastName = name
         try {
-            sendBroadcast(Intent("intent.tuoluoyi.midi_device")
+            sendBroadcast(Intent("intent.panpanpan.midi_device")
                 .setPackage(packageName)
                 .putExtra("name", name)
                 .putExtra("connected", name.isNotEmpty()))
@@ -689,7 +674,7 @@ class tuoluoyiService : AccessibilityService() {
         // 1536x1536 = ~9 MB Bitmap kalo di-decode -> rawan OOM di MIUI yg
         // memang lagi ketat memory.
         val stopIntent = PendingIntent.getBroadcast(this, 0,
-            Intent("intent.tuoluoyi.exit").setPackage(packageName),
+            Intent("intent.panpanpan.exit").setPackage(packageName),
             PendingIntent.FLAG_IMMUTABLE)
         val openIntent = PendingIntent.getActivity(this, 0,
             Intent(this, MainActivity::class.java),

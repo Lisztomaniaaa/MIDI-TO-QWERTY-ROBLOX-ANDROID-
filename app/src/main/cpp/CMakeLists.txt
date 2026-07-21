@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.22.1)
 
 # Declares and names the project.
 
-project("tuoluoyi")
+project("panpanpan")
 
 # Creates and names a library, sets it as either STATIC
 # or SHARED, and provides the relative paths to its source code.
@@ -15,7 +15,7 @@ project("tuoluoyi")
 # Gradle automatically packages shared libraries with your APK.
 
 add_library( # Sets the name of the library.
-        tuoluoyi
+        panpanpan
 
         # Sets the library as a shared library.
         SHARED
@@ -28,13 +28,13 @@ add_library( # Sets the name of the library.
 # must be as tight as possible; -O3 lets the compiler inline the lookup-table
 # access and report assembly. Section GC trims unused code so the daemon stays
 # small and warm in cache.
-target_compile_options(tuoluoyi PRIVATE
+target_compile_options(panpanpan PRIVATE
         -O3
         -fvisibility=hidden
         -ffunction-sections
         -fdata-sections)
 
-target_link_options(tuoluoyi PRIVATE
+target_link_options(panpanpan PRIVATE
         -Wl,--gc-sections)
 
 # Searches for a specified prebuilt library and stores the path as a
@@ -55,7 +55,7 @@ find_library( # Sets the name of the path variable.
 # build script, prebuilt third-party libraries, or system libraries.
 
 target_link_libraries( # Specifies the target library.
-        tuoluoyi
+        panpanpan
 
         # Links the target library to the log library
         # included in the NDK.

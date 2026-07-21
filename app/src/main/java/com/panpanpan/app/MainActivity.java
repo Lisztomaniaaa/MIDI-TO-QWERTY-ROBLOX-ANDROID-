@@ -84,11 +84,11 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
         public void onReceive(Context context, Intent intent) {
             if (intent.getAction() == null) return;
             switch (intent.getAction()) {
-                case "intent.tuoluoyi.sendBinder":
+                case "intent.panpanpan.send_binder":
                     // Daemon ready — force health check
                     healthMonitor.forceCheck();
                     break;
-                case "intent.tuoluoyi.exit":
+                case "intent.panpanpan.exit":
                     healthMonitor.forceCheck();
                     break;
             }
@@ -152,7 +152,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
         swVelocity.setOnCheckedChangeListener((btn, checked) -> {
             sp.edit().putBoolean("velocity_enabled", checked).apply();
             try {
-                sendBroadcast(new Intent("intent.tuoluoyi.set_velocity")
+                sendBroadcast(new Intent("intent.panpanpan.set_velocity")
                         .setPackage(getPackageName())
                         .putExtra("enabled", checked));
             } catch (Throwable t) {
@@ -163,10 +163,10 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
 
     private void registerReceivers() {
         try {
-            IntentFilter f1 = new IntentFilter("intent.tuoluoyi.sendBinder");
+            IntentFilter f1 = new IntentFilter("intent.panpanpan.send_binder");
             ContextCompat.registerReceiver(this, receiver, f1,
                     ContextCompat.RECEIVER_EXPORTED);
-            IntentFilter f2 = new IntentFilter("intent.tuoluoyi.exit");
+            IntentFilter f2 = new IntentFilter("intent.panpanpan.exit");
             ContextCompat.registerReceiver(this, receiver, f2,
                     ContextCompat.RECEIVER_NOT_EXPORTED);
             isBroadcastRegistered = true;
@@ -274,7 +274,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
             swToggle.setChecked(device.enabled);
             swToggle.setOnCheckedChangeListener((btn, checked) -> {
                 device.enabled = checked;
-                // TODO: notify tuoluoyiService of device enable/disable
+                // TODO: notify MidiBridgeService of device enable/disable
             });
 
             midiDeviceList.addView(row);
@@ -319,7 +319,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
         bg.execute(() -> {
             try {
                 disableAccessibilityService();
-                sendBroadcast(new Intent("intent.tuoluoyi.exit"));
+                sendBroadcast(new Intent("intent.panpanpan.exit"));
             } catch (Throwable t) {
                 Log.e(TAG, "stopPlayback", t);
             }
@@ -348,7 +348,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
         // This ensures the floating panel disappears even if the service
         // hasn't processed stopService yet.
         try {
-            sendBroadcast(new Intent("intent.papiano.force_remove_overlay")
+            sendBroadcast(new Intent("intent.panpanpan.force_remove_overlay")
                     .setPackage(getPackageName()));
         } catch (Throwable ignored) {}
 
@@ -362,7 +362,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
                 if (gp != null) gp.closeAndExit();
             } catch (Throwable ignored) {}
             try {
-                sendBroadcast(new Intent("intent.tuoluoyi.exit"));
+                sendBroadcast(new Intent("intent.panpanpan.exit"));
             } catch (Throwable ignored) {}
             // Fallback: closeAndExit() over the binder does nothing if the
             // binder is already dead. Without this, the daemon process
@@ -399,7 +399,7 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
 
     private void disableAccessibilityService() {
         String svcName = new ComponentName(getPackageName(),
-                tuoluoyiService.class.getName()).flattenToString();
+                MidiBridgeService.class.getName()).flattenToString();
         String cur = Settings.Secure.getString(getContentResolver(),
                 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
         if (cur != null && cur.contains(svcName)) {
@@ -520,8 +520,8 @@ public class MainActivity extends Activity implements PermissionHealthMonitor.He
 
         try {
             FileInputStream in = new FileInputStream(
-                    getApplicationInfo().nativeLibraryDir + "/libtuoluoyi.so");
-            FileOutputStream out = new FileOutputStream(base + "/libtuoluoyi.so");
+                    getApplicationInfo().nativeLibraryDir + "/libpanpanpan.so");
+            FileOutputStream out = new FileOutputStream(base + "/libpanpanpan.so");
             byte[] buf = new byte[4096]; int l;
             while ((l = in.read(buf)) > 0) out.write(buf, 0, l);
             in.close(); out.close();

@@ -26,7 +26,7 @@ public class GamePadNative {
             return;
         }
 
-        System.loadLibrary("tuoluoyi");
+        System.loadLibrary("panpanpan");
 
         System.out.println("Start GamePad Service. Enter \"exit\" here at any time to exit.");
         sendBinderToAppByStickyBroadcast();//发送binder给APP // This is called ONLY once, it's a special type of broadcast called a sticky broadcast
@@ -92,7 +92,7 @@ public class GamePadNative {
                     // velocity: 0 = velocity OFF (QWERTY polos). >0 = Visual Piano
                     // velocity mode -> native akan tap Alt+<velKey> (skema 32-step)
                     // sebelum not kalau level velocity berubah. Gating ON/OFF
-                    // dilakukan di tuoluoyiService (kirim 0 saat toggle OFF).
+                    // dilakukan di MidiBridgeService (kirim 0 saat toggle OFF).
                     nativeQwertyKey(noteNumber, isDown, velocity);
                 }
 
@@ -127,7 +127,7 @@ public class GamePadNative {
             //把binder填到一个可以用Intent来传递的容器中
             BinderContainer binderContainer = new BinderContainer(binder);
             // 创建 Intent 对象，并将binder作为附加参数
-            Intent intent = new Intent("intent.tuoluoyi.sendBinder");
+            Intent intent = new Intent("intent.panpanpan.send_binder");
             intent.putExtra("binder", binderContainer);
             // Scope to our own package. Without this, ANY app on the device
             // that registers a receiver for this same (unscoped) action name

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Accessibility config — service ini cuma kepake utk:
-    1. Filter VOLUME_UP key event (lihat onKeyEvent di tuoluoyiService.kt)
+    1. Filter VOLUME_UP key event (lihat onKeyEvent di MidiBridgeService.kt)
     2. Bind ke system supaya bisa add TYPE_ACCESSIBILITY_OVERLAY popup
   accessibilityEventTypes WAJIB ada (kalo kosong, di sebagian device service
   ga di-bind dgn benar -> popup gagal di-add). typeAllMask aman & ga ngapa2in

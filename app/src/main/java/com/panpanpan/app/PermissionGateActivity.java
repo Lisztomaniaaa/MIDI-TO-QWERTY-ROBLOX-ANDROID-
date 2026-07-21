@@ -151,7 +151,7 @@ public class PermissionGateActivity extends Activity {
      * is "is the activation source (Shizuku/root) even reachable", which is
      * an instant, real check (no sleep/guessing involved). Everything else's
      * real status is reported continuously by PermissionHealthMonitor /
-     * tuoluoyiService once we land on Home — same source of truth the rest
+     * MidiBridgeService once we land on Home — same source of truth the rest
      * of the app already relies on, instead of a one-time snapshot taken
      * moments after firing off async shell commands.
      */
@@ -183,7 +183,7 @@ public class PermissionGateActivity extends Activity {
 
             // Brief pause for UX pacing only — not a pass/fail gate. The
             // daemon connects asynchronously via sticky broadcast ->
-            // tuoluoyiService -> GamePadBridge; Home screen's health monitor
+            // MidiBridgeService -> GamePadBridge; Home screen's health monitor
             // shows the real, live status from here on.
             Thread.sleep(500);
 
@@ -342,7 +342,7 @@ public class PermissionGateActivity extends Activity {
     // ═══════════ UNZIP DAEMON FILES ═══════════
 
     /**
-     * Extract starter.sh, GyroNative.dex, libtuoluoyi.so to external files dir.
+     * Extract starter.sh, GyroNative.dex, libpanpanpan.so to external files dir.
      * These are required for the daemon to start. Must run before DaemonControl.respawn().
      */
     private void unzipFiles() {
@@ -377,8 +377,8 @@ public class PermissionGateActivity extends Activity {
 
         try {
             java.io.FileInputStream in = new java.io.FileInputStream(
-                    getApplicationInfo().nativeLibraryDir + "/libtuoluoyi.so");
-            java.io.FileOutputStream out = new java.io.FileOutputStream(base + "/libtuoluoyi.so");
+                    getApplicationInfo().nativeLibraryDir + "/libpanpanpan.so");
+            java.io.FileOutputStream out = new java.io.FileOutputStream(base + "/libpanpanpan.so");
             byte[] buf = new byte[4096]; int l;
             while ((l = in.read(buf)) > 0) out.write(buf, 0, l);
             in.close(); out.close();

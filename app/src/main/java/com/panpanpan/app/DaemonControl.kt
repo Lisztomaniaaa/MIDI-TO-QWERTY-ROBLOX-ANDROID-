@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Single place that shells out to the Shizuku/root-spawned daemon process.
  *
- * Before this, respawn logic was duplicated in tuoluoyiService (bridge health
+ * Before this, respawn logic was duplicated in MidiBridgeService (bridge health
  * loop, tied to the AccessibilityService) AND PermissionHealthMonitor (tied to
  * MainActivity). Both loops could fire respawnDaemon() around the same time
  * with no shared state, stacking multiple app_process/uHID daemon instances
@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Centralizing here gives both loops one cooldown + in-flight guard.
  */
 object DaemonControl {
-    // Same tag as tuoluoyiService — anyone already filtering logcat for
+    // Same tag as MidiBridgeService — anyone already filtering logcat for
     // "Papiano" (e.g. MatLog) picks these up automatically, no extra setup.
     private const val TAG = "PapianoMidi"
     private const val RESPAWN_COOLDOWN_MS = 8_000L

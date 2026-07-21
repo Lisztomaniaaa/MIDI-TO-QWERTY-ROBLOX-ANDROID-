@@ -559,7 +559,7 @@ Java_com_panpanpan_app_GamePadNative_nativeQwertyKey(JNIEnv *env,
         }
 
         // VELOCITY: velocity>0 artinya Visual Piano velocity mode aktif untuk
-        // event ini (gating ON/OFF dilakukan di tuoluoyiService — OFF kirim 0).
+        // event ini (gating ON/OFF dilakukan di MidiBridgeService — OFF kirim 0).
         // Tap Alt+velKey SEBELUM not ditekan, dan cuma kalau level berubah.
         // Dilakukan sebelum push not baru supaya tapVelocityKey cuma bawa not
         // yg lagi bener-bener di-hold (bukan not baru ini).

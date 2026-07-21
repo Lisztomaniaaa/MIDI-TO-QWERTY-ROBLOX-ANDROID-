@@ -11,7 +11,7 @@ import android.view.accessibility.AccessibilityManager
  * Every accessibility-enable call site in this app used to just check
  * "does the Settings.Secure string already contain our service name" before
  * deciding whether to write it — MainActivity, PermissionGateActivity, and
- * tuoluoyiService's auto-grant all did this same check independently.
+ * MidiBridgeService's auto-grant all did this same check independently.
  *
  * That string reflects what Android was TOLD, not what it actually bound.
  * On Android 13+, a sideloaded app's Accessibility Service can be blocked by
@@ -33,7 +33,7 @@ object AccessibilityGate {
     private const val TAG = "PapianoMidi"
 
     private fun serviceComponent(context: Context): ComponentName =
-        ComponentName(context.packageName, tuoluoyiService::class.java.name)
+        ComponentName(context.packageName, MidiBridgeService::class.java.name)
 
     /** True only if Android actually bound the service, not just "listed in settings". */
     @JvmStatic
